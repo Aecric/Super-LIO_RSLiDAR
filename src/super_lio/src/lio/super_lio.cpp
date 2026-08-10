@@ -78,7 +78,13 @@ void SuperLIO::init(){
   }
   if (g_enable_keyframe_pub || g_enable_backend) {
     keyframe_manager_ = std::make_unique<KeyframeManager>(
-      g_loop_kf_trans_thresh, g_loop_kf_rot_thresh);
+      g_loop_kf_trans_thresh, g_loop_kf_rot_thresh,
+      static_cast<std::size_t>(std::max(1, g_loop_submap_scan_num)),
+      g_loop_submap_voxel_size,
+      [wrapper = data_wrapper_](const LoopKeyframe & keyframe) {
+        wrapper->pub_keyframe(
+          keyframe.id, keyframe.state, keyframe.cloud);
+      });
   }
   
   points_world_v3_.reserve(21000);
@@ -109,7 +115,57 @@ void SuperLIO::stateWaitMapInit()
   }
 }
 
+void SuperLIO::Reset(){
+  ivox_.reset(new OctVoxMapType(OctVoxMapType::Options{g_ivox_resolution, g_ivox_capacity}));
+  kf_.reset(new ESKF());
+  data_wrapper_->setESKF(kf_);
+  data_wrapper_->clear();
+
+  scan_undistort_full_->clear();
+  ds_undistort_->clear();
+  world_pc_->clear();
+  ds_world_->clear();
+  if(point_map_){
+    point_map_->clear();
+  }
+  if (g_enable_keyframe_pub || g_enable_backend) {
+    keyframe_manager_ = std::make_unique<KeyframeManager>(
+      g_loop_kf_trans_thresh, g_loop_kf_rot_thresh,
+      static_cast<std::size_t>(std::max(1, g_loop_submap_scan_num)),
+      g_loop_submap_voxel_size,
+      [wrapper = data_wrapper_](const LoopKeyframe & keyframe) {
+        wrapper->pub_keyframe(
+          keyframe.id, keyframe.state, keyframe.cloud);
+      });
+  }
+
+  init_imu_count_ = 0;
+  init_mean_gyro_ = V3::Zero();
+  init_mean_acce_ = V3::Zero();
+  frame_num_ = 0;
+  flg_init_ = false;
+  flg_first_scan_ = true;
+  g_flg_map_init = true;
+  effect_knn_num_ = 0;
+  pcd_index_ = -1;
+  state_fn_ = &SuperLIO::stateWaitKFInit;
+
+  LOG(INFO) << GREEN << " ---> [SuperLIO]: reset; waiting for KF init." << RESET;
+}
+
+
 void SuperLIO::process(){
+  // Standby: no sensor subscriptions, nothing to do. The next activation edge
+  // wipes the state so the new session starts from a clean map and filter.
+  if(!data_wrapper_->is_active()){
+    was_active_ = false;
+    return;
+  }
+  if(!was_active_){
+    was_active_ = true;
+    Reset();
+  }
+
   if(!data_wrapper_->sync_measure(measures_)){
     return;
   }
@@ -118,9 +174,9 @@ void SuperLIO::process(){
 
 
 bool SuperLIO::kf_init(){
-  static int imu_cout = 0;
-  static V3 mean_gyro = V3::Zero();
-  static V3 mean_acce = V3::Zero();
+  int& imu_cout = init_imu_count_;
+  V3& mean_gyro = init_mean_gyro_;
+  V3& mean_acce = init_mean_acce_;
 
   for(auto& imu: measures_.imu){
     imu_cout ++;
@@ -131,6 +187,17 @@ bool SuperLIO::kf_init(){
   /// 100 Hz for 1 second.
   if(imu_cout < 50){
     return false;
+  }
+
+  // The mean accelerometer vector is taken as gravity and the mean gyro as the
+  // gyro bias, so both are only valid if the platform is essentially still for
+  // this window. Moving during init bakes the motion into the attitude and the
+  // bias, which then leaks into every pose of the session.
+  if(mean_gyro.norm() > 0.05){
+    LOG(WARNING) << YELLOW << " ---> [SuperLIO]: init while rotating (mean gyro "
+                 << mean_gyro.norm() << " rad/s); gravity alignment and gyro bias "
+                 << "will be off. Keep the platform still when starting."
+                 << RESET;
   }
 
   V3 gravity = - mean_acce * g_gravity_norm / mean_acce.norm();
@@ -220,13 +287,7 @@ void SuperLIO::processLoopKeyframe()
   if (!keyframe_manager_) {
     return;
   }
-  const auto keyframe =
-    keyframe_manager_->consider(kf_->GetNavState(), ds_undistort_);
-  if (!keyframe) {
-    return;
-  }
-  data_wrapper_->pub_keyframe(
-    keyframe->id, keyframe->state, keyframe->cloud);
+  keyframe_manager_->consider(kf_->GetNavState(), ds_undistort_);
 }
 
 
@@ -333,6 +394,9 @@ void SuperLIO::ProcessCaceMap(){
 
 void SuperLIO::saveMap(){
   if(!g_save_map) return;
+  if (keyframe_manager_) {
+    keyframe_manager_->stop();
+  }
   if (g_enable_backend && saveCorrectedKeyframeMap()) {
     return;
   }
@@ -376,7 +440,11 @@ void SuperLIO::saveMap(){
 
 bool SuperLIO::saveCorrectedKeyframeMap()
 {
-  if (!keyframe_manager_ || keyframe_manager_->keyframes().empty()) {
+  if (!keyframe_manager_) {
+    return false;
+  }
+  const auto keyframes = keyframe_manager_->keyframes();
+  if (keyframes.empty()) {
     return false;
   }
 
@@ -412,7 +480,6 @@ bool SuperLIO::saveCorrectedKeyframeMap()
     transforms.emplace(ids[i], transform);
   }
 
-  const auto & keyframes = keyframe_manager_->keyframes();
   if (transforms.size() != keyframes.size()) {
     LOG(WARNING) << YELLOW
                  << " ---> Backend pose count does not match local keyframes; "
@@ -678,7 +745,13 @@ void SuperLIO::UpdateMap() {
 
 void SuperLIO::Output(){
   auto state = kf_->GetNavState();
-  data_wrapper_->pub_odom(state);  
+  data_wrapper_->pub_odom(state);
+
+  // Ahead of the g_visual_map block on purpose: that block decimates by
+  // g_pub_step and returns early, and downstream modeling needs every scan.
+  if(g_pub_body_cloud){
+    data_wrapper_->pub_cloud_body_odom(scan_undistort_full_, state);
+  }
 
   Eigen::Matrix4f transformation = Eigen::Matrix4f::Identity();
   transformation.block<3, 3>(0, 0) = state.R.R_.cast<float>();

@@ -24,6 +24,8 @@ namespace LI2Sup{
   bool g_enable_keyframe_pub = false;
   double g_loop_kf_trans_thresh = 1.0;
   double g_loop_kf_rot_thresh = 15.0;
+  int g_loop_submap_scan_num = 10;
+  double g_loop_submap_voxel_size = 0.2;
   string g_loop_keyframe_topic = "/super_lio/keyframe";
   bool g_enable_backend = false;
   double g_backend_service_timeout = 5.0;
@@ -73,6 +75,11 @@ namespace LI2Sup{
   bool g_visual_map = true;
   bool g_visual_dense = false;
   int  g_pub_step;
+
+  bool g_start_active = true;
+  bool g_pub_body_cloud = false;
+  std::string g_body_cloud_topic = "/lio/cloud_body";
+  std::string g_body_odom_topic  = "/lio/odom_body";
 
   /// for planner
   bool g_planner_enable;

@@ -42,6 +42,8 @@ namespace LI2Sup{
   extern bool g_enable_keyframe_pub;
   extern double g_loop_kf_trans_thresh;
   extern double g_loop_kf_rot_thresh;
+  extern int g_loop_submap_scan_num;
+  extern double g_loop_submap_voxel_size;
   extern std::string g_loop_keyframe_topic;
   extern bool g_enable_backend;
   extern double g_backend_service_timeout;
@@ -91,6 +93,14 @@ namespace LI2Sup{
   extern bool g_visual_map;
   extern bool g_visual_dense;
   extern int  g_pub_step;
+
+  /// undistorted body-frame scan + matching pose, for downstream consumers that
+  /// need motion-compensated points in the sensor frame (e.g. target modeling).
+  /// come up processing immediately, vs. on standby awaiting ~/set_active
+  extern bool g_start_active;
+  extern bool g_pub_body_cloud;
+  extern std::string g_body_cloud_topic;
+  extern std::string g_body_odom_topic;
 
   /// for planner
   extern bool g_planner_enable;
