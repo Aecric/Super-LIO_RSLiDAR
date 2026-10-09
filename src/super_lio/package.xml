@@ -25,6 +25,11 @@
   <exec_depend>rosidl_default_runtime</exec_depend>
   <member_of_group>rosidl_interface_packages</member_of_group>
 
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>ament_index_python</exec_depend>
+  <test_depend>rclpy</test_depend>
+  <test_depend>tf2_msgs</test_depend>
+
   <export>
     <build_type>ament_cmake</build_type>
   </export>

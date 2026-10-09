@@ -99,7 +99,11 @@ install(TARGETS
   DESTINATION lib/${PROJECT_NAME}
 )
 
+add_executable(run_loclite_online src/apps/run_loclite_online.cpp)
+target_link_libraries(run_loclite_online lio ${cpp_typesupport_target})
+
 install(TARGETS
+  run_loclite_online
   relocation_node
   DESTINATION lib/${PROJECT_NAME}
 )

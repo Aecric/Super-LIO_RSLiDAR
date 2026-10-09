@@ -24,6 +24,8 @@ public:
   ~SuperLIOReLoc(){};
 
   void init() override;
+  void Reset() override;
+  void process() override;
 
 private:
   bool kf_init() override;
@@ -32,6 +34,9 @@ private:
   void Output() override;
 
 private:
+  bool map_loaded_ = false;
+  int init_frame_count_ = 0;
+  bool has_init_pose_ = false;
   BASIC::CloudPtr init_obs_data_;
   bool flg_get_init_guess_ = false;
   BASIC::SE3 re_init_pose_;

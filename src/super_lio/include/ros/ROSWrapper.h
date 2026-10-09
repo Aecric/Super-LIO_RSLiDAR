@@ -3,6 +3,9 @@
 #define ROSWRAPPER_HPP_
 
 #include <map>
+#include <std_msgs/msg/int32.hpp>
+#include <std_msgs/msg/float32_multi_array.hpp>
+#include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #include <tuple>
 #include <deque>
 #include <atomic>
@@ -54,7 +57,7 @@ void livox2pcl(const livox_ros_driver2::msg::CustomMsg::SharedPtr& msg, BASIC::C
 
 class ROSWrapper : public rclcpp::Node {
 public:
-  explicit ROSWrapper(const rclcpp::NodeOptions& options = rclcpp::NodeOptions());
+  explicit ROSWrapper(const rclcpp::NodeOptions& options = rclcpp::NodeOptions(), bool localization = false);
   ~ROSWrapper(){};
   using Ptr = std::shared_ptr<ROSWrapper>;
   bool sync_measure(MeasureGroup&);
@@ -68,6 +71,8 @@ public:
     last_timestamp_imu_ = -1.0;
     last_timestamp_lidar_ = -1.0;
     path_.poses.clear();
+    last_output_stamp_ = last_path_stamp_ = -1;
+    fps_ = 0;
     last_path_point_ = BASIC::V3(0, 0, -100);
   }
 
@@ -75,7 +80,11 @@ public:
   /// nothing is deserialised and nothing is processed.
   bool is_active() const { return active_.load(std::memory_order_acquire); }
 
+  bool localization() const { return localization_; }
+  void setLocState(int state) { loc_state_ = state; }
+  int locState() const { return loc_state_; }
   void pub_odom(const NavState&);
+
   void pub_cloud_world(const BASIC::CloudPtr& pc, double time);
   void pub_cloud2planner(const BASIC::CloudPtr& pc, double time);
   void pub_cloud_world_pose(const BASIC::CloudPtr& pc, 
@@ -111,6 +120,24 @@ private:
   void livoxHandler(const livox_ros_driver2::msg::CustomMsg::SharedPtr msg);
   void stdMsgHandler(const sensor_msgs::msg::PointCloud2::SharedPtr msg);
 
+  void setupLocalization();
+  void publishLocalization(const NavState& state);
+  void publishLocStatus();
+  bool localization_ = false;
+  int loc_state_ = 5;
+  std::string map_frame_ = "map", loc_lidar_frame_ = "livox_frame";
+  std::string base_frame_ = "livox_frame", level_frame_ = "level_frame";
+  BASIC::SE3 lidar_base_;
+  bool publish_tf_ = true, publish_odom_ = true, publish_path_ = true;
+  double last_imu_received_ = -1, last_lidar_received_ = -1;
+  double last_output_stamp_ = -1, last_path_stamp_ = -1, fps_ = 0;
+  double imu_timeout_ = 1, lidar_timeout_ = 2;
+  rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr loc_state_pub_, ndt_status_pub_;
+  rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr loc_status_pub_;
+  rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr loc_marker_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr global_map_pub_;
+  rclcpp::TimerBase::SharedPtr loc_status_timer_, global_map_timer_;
+  rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr init_pose_sub_;
   void setupParams();
   void setupIO();
   void createSensorSubscriptions();
