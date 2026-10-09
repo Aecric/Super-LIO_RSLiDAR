@@ -26,7 +26,7 @@
     lio.sensor.maxrange: 150.0
     lio.sensor.filter_rate: 1
     lio.sensor.enable_downsample: true
-    lio.sensor.voxel_fliter_size: 0.5
+    lio.sensor.voxel_fliter_size: 0.2
     lio.sensor.gravity_norm: 9.7946
     lio.sensor.imu_type: 1
     lio.sensor.imu_na: 0.1
@@ -34,8 +34,18 @@
     lio.sensor.imu_nba: 0.001
     lio.sensor.imu_nbg: 0.001
 
-    # Fairy DIFOP factory calibration: LiDAR frame -> IMU frame.
-    # Same convention as Faster-LIO extrinsic_T / extrinsic_R.
+    # Airy DIFOP factory calibration T_L_I (IMU pose in the LiDAR frame):
+    #   Airy IMU extrinsic q[x,y,z,w]: [-0.70693, 0.707255, 0.00505469, -0.00382652]
+    #                      t[x,y,z]:   [0.00425, 0.00418, -0.00446]
+    # lio.extrinsic.lidar_imu stores the inverse T_I_L (p_imu = R_I_L * p_lidar + t_I_L):
+    #   R_I_L = R_L_I^T, t_I_L = -R_I_L * t_L_I.
+    # Layout: [t_I_L(3), R_I_L(9)]. ROSWrapper builds the rotation with
+    # M3(ptr), which is Eigen column-major, so the three rows below are the
+    # COLUMNS of R_I_L (equivalently the rows of R_L_I).
+    # lio.extrinsic.lidar_imu: [0.004174259433, 0.004303806686, -0.004413536699,
+    #                           -0.000470517830, -0.999921018472, -0.012559276666,
+    #                           -0.999998385973,  0.000448702556,  0.001739746242,
+    #                           -0.001733973455,  0.012560074977, -0.999919615695]
     lio.extrinsic.lidar_imu: [0.0136500001, 0.0078199999, 0.0049200002,
                               0.999909633806, -0.009623852732, -0.009386462752,
                               0.009649829532,  0.999949723263,  0.002726121462,
@@ -43,7 +53,7 @@
     lio.extrinsic.odom_robo: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
     lio.hash_map.hash_capacity: 2000000
-    lio.hash_map.vox_resolution: 0.5
+    lio.hash_map.vox_resolution: 0.2
 
     lio.kf.kf_type: 0
     lio.kf.kf_max_iterations: 4
