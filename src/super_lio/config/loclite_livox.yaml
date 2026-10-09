@@ -1,0 +1,83 @@
+/**:
+  ros__parameters:
+    lio.map.save_map: false
+    lio.map.if_filter: true
+    lio.map.save_map_dir: "map"
+    lio.map.map_name: "map.pcd"
+    lio.map.ds_size: 0.3
+    lio.map.save_interval: 500
+
+    lio.loop.enable_keyframe_pub: false
+    lio.loop.kf_trans_thresh: 1.0
+    lio.loop.kf_rot_thresh: 15.0
+    lio.loop.keyframe_topic: "/super_lio/keyframe"
+    lio.loop.enable_backend: false
+    lio.loop.backend_service_timeout: 5.0
+
+    lio.ros.lidar_topic: "/livox/lidar"
+    lio.ros.imu_topic: "/livox/imu"
+
+    lio.sensor.lidar_type: 1
+    lio.sensor.blind: 0.3
+    lio.sensor.maxrange: 100.0
+    lio.sensor.filter_rate: 3
+    lio.sensor.enable_downsample: true
+    lio.sensor.voxel_fliter_size: 0.5
+    lio.sensor.gravity_norm: 9.7946
+    lio.sensor.imu_type: 1
+    lio.sensor.imu_na: 0.1
+    lio.sensor.imu_ng: 0.1
+    lio.sensor.imu_nba: 0.0001
+    lio.sensor.imu_nbg: 0.0001
+
+    lio.extrinsic.lidar_imu: [-0.011, -0.02329, 0.04412, 
+                              1.0, 0.0, 0.0, 
+                              0.0, 1.0, 0.0, 
+                              0.0, 0.0, 1.0]
+    lio.extrinsic.odom_robo: [0.0, 0.0, 0.13, 0.0, 0.0, 0.0]
+
+    lio.hash_map.hash_capacity: 100000000
+    lio.hash_map.vox_resolution: 0.5
+    lio.hash_map.insert_resolution: 0.5
+
+    lio.kf.kf_type: 0
+    lio.kf.kf_max_iterations: 4
+    lio.kf.kf_align_gravity: true
+    lio.kf.kf_quit_eps: 0.001
+
+    lio.submap.submap_resolution: 0.5
+    lio.submap.submap_capacity: 1000000
+
+    lio.output.robot: false
+    lio.output.plan_env_world: false
+    lio.output.plan_env_body: false
+    lio.output.ml_map: false
+    lio.output.planner: false
+    lio.output.map: true
+    lio.output.dense: true
+    lio.output.pub_step: 1
+
+    lio.relocation.update_map: false
+    lio.relocation.init_pose: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+    lio.eva.timer: true
+
+    # Fixed-map localization interface. --map_path overrides system.map_path.
+    system.map_path: ""
+    fixed_map.global_pcd: ""
+    common.map_frame_id: "map"
+    system.lidar_frame_id: "livox_frame"
+    system.base_frame_id: "livox_frame"
+    system.level_frame_id: "level_frame"
+    # T_base_lidar; translation in metres, roll/pitch/yaw in radians.
+    system.base_to_lidar_x: 0.0
+    system.base_to_lidar_y: 0.0
+    system.base_to_lidar_z: 0.0
+    system.base_to_lidar_roll: 0.0
+    system.base_to_lidar_pitch: 0.0
+    system.base_to_lidar_yaw: 0.0
+    runtime.publish_tf: true
+    runtime.publish_odom: true
+    runtime.publish_path: true
+    runtime.imu_timeout_sec: 1.0
+    runtime.lidar_timeout_sec: 2.0

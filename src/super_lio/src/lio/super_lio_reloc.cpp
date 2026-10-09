@@ -105,9 +105,30 @@ void SuperLIOReLoc::init(){
 }
 
 
+void SuperLIOReLoc::Reset() {
+  auto fixed_map = point_map_;
+  auto fixed_index = ivox_;
+  point_map_.reset(new PointCloudType());
+  SuperLIO::Reset();
+  point_map_ = fixed_map;
+  ivox_ = fixed_index;
+  init_frame_count_ = 0;
+  init_obs_data_->clear();
+  has_init_pose_ = false;
+  if (data_wrapper_->localization()) data_wrapper_->setLocState(5);
+}
+
+void SuperLIOReLoc::process() {
+  if (data_wrapper_->localization() && data_wrapper_->is_active()) {
+    if (flg_get_init_guess_ && kf_->init_) Reset();
+    // Once tracking is lost, require a validated new initial pose.
+    if (data_wrapper_->locState() == 4 && kf_->init_) Reset();
+  }
+  SuperLIO::process();
+}
+
 bool SuperLIOReLoc::map_init(){
-  static bool pcd_loaded = false;
-  if(pcd_loaded) return true;
+  if(map_loaded_) return true;
 
   std::string map_name = g_save_map_dir + "/" + g_map_name;
   if(pcl::io::loadPCDFile<PointType>(map_name, *point_map_) == -1){
@@ -116,7 +137,10 @@ bool SuperLIOReLoc::map_init(){
   }
 
   std::vector<int> useless_indices;
+  point_map_->is_dense = false;
   pcl::removeNaNFromPointCloud(*point_map_, *point_map_, useless_indices);
+
+  if (point_map_->empty()) return false;
 
   VV3 point_map_v3;
   point_map_v3.reserve(point_map_->size());
@@ -125,13 +149,18 @@ bool SuperLIOReLoc::map_init(){
     point_map_v3.push_back(pt);
   }
 
+  if (data_wrapper_->localization()) {
+    // No LRU eviction while loading a fixed map, even with a small configured capacity.
+    const auto capacity = std::max(static_cast<std::size_t>(g_ivox_capacity), point_map_v3.size() + 1);
+    ivox_.reset(new OctVoxMapType(OctVoxMapType::Options{g_ivox_resolution, capacity}));
+  }
   ivox_->insert(point_map_v3);
 
   LOG(INFO) << GREEN << " ---> Load map success. File: " << map_name << RESET;
   LOG(INFO) << GREEN << " ---> Map size: " << point_map_->size() << RESET;
   ivox_->printInfo();
 
-  pcd_loaded = true;
+  map_loaded_ = true;
 
   data_wrapper_->set_global_map(point_map_);
   data_wrapper_->set_initial_data(re_init_pose_, flg_get_init_guess_);
@@ -141,10 +170,10 @@ bool SuperLIOReLoc::map_init(){
 
 bool SuperLIOReLoc::kf_init(){
   const int need_init_frames = 10;
-  static int imu_cout = 0;
-  static int init_frame_count = 0;
-  static V3 mean_gyro = V3::Zero();
-  static V3 mean_acce = V3::Zero();
+  int& imu_cout = init_imu_count_;
+  int& init_frame_count = init_frame_count_;
+  V3& mean_gyro = init_mean_gyro_;
+  V3& mean_acce = init_mean_acce_;
 
   /// get init guess from ROS topic.
   if(flg_get_init_guess_){
@@ -154,8 +183,12 @@ bool SuperLIOReLoc::kf_init(){
     mean_gyro = V3::Zero();
     mean_acce = V3::Zero();
     flg_get_init_guess_ = false;
+    has_init_pose_ = true;
+    if (data_wrapper_->localization()) data_wrapper_->setLocState(1);
     return false;
   }
+
+  if (data_wrapper_->localization() && !has_init_pose_) return false;
 
   CloudPtr point_cloud_pcl = CloudPtr(new PointCloudType());
   for(std::size_t i = 0; i < measures_.lidar.pc->size(); i++){
@@ -189,6 +222,8 @@ bool SuperLIOReLoc::kf_init(){
 
   LOG(INFO) << YELLOW << " ---> INIT start... obs_data size: " << init_obs_data_->size() << " target size: " << point_map_->size() << RESET;
 
+  if (!mean_acce.allFinite() || mean_acce.norm() < 1e-3) return false;
+
   V3 gravity = - mean_acce * g_gravity_norm / mean_acce.norm();
   V3 ref_gravity(0, 0, - g_gravity_norm);
   M3 init_rot = Quat::FromTwoVectors(gravity, ref_gravity).toRotationMatrix();
@@ -204,6 +239,11 @@ bool SuperLIOReLoc::kf_init(){
   init_guess_T.block<3, 3>(0, 0) = init_guess_R_;
   init_guess_T.block<3, 1>(0, 3) = init_guess_t_;
 
+
+  if (data_wrapper_->localization()) {
+    // /initialpose denotes map<-lidar, while registration source is in IMU.
+    init_guess_T = (re_init_pose_ * g_lidar_imu.inverse()).matrix();
+  }
 
   pcl::PointCloud<pcl::PointXYZI>::Ptr tmp_src(new pcl::PointCloud<pcl::PointXYZI>());
   pcl::transformPointCloud(*init_obs_data_, *tmp_src, g_lidar_imu.matrix().cast<float>());
@@ -230,7 +270,9 @@ bool SuperLIOReLoc::kf_init(){
   ndt.align(*unused_result, init_guess_T.matrix().cast<float>());
   icp.align(*unused_result, ndt.getFinalTransformation());
 
-  if (icp.hasConverged() == false || icp.getFitnessScore() > 1.5)
+  if (!ndt.hasConverged() || !icp.hasConverged() ||
+      !icp.getFinalTransformation().allFinite() || !std::isfinite(icp.getFitnessScore()) ||
+      icp.getFitnessScore() > 1.5)
   // if (icp.hasConverged() == false)
   {
     /// reset init state.
@@ -267,19 +309,17 @@ bool SuperLIOReLoc::kf_init(){
   sys_init_pose_ = kf_->GetSE3();
 
   {
-    point_map_->clear();
-    point_map_.reset(new PointCloudType());
     init_obs_data_->clear();
-    init_obs_data_ = nullptr;
     data_wrapper_->set_initial_data(re_init_pose_, flg_get_init_guess_, true);
   }
 
+  if (data_wrapper_->localization()) data_wrapper_->setLocState(2);
   return true;
 }
 
 
 void SuperLIOReLoc::UpdateMap() {
-  if(!g_update_map) return;
+  if(data_wrapper_->localization() || !g_update_map) return;
   
   static int __update_delay = 100;
   if(__update_delay > 0){
@@ -309,6 +349,16 @@ void SuperLIOReLoc::UpdateMap() {
 
 void SuperLIOReLoc::Output() {
   auto state = kf_->GetNavState();
+  if (data_wrapper_->localization()) {
+    std::size_t matched = 0;
+    for (std::size_t i = 0; i < effect_knn_num_; ++i)
+      if (effect_mask_[effect_knn_idxs_[i]]) ++matched;
+    if (!state.p.allFinite() || !state.R.R_.allFinite() || matched < 10) {
+      data_wrapper_->setLocState(4);
+      return;
+    }
+    data_wrapper_->setLocState(2);
+  }
   data_wrapper_->pub_odom(state);  
 
   Eigen::Matrix4f transformation = Eigen::Matrix4f::Identity();

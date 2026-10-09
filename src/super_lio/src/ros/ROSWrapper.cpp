@@ -319,10 +319,15 @@ inline builtin_interfaces::msg::Time toRosTime(double t_sec)
 }
 
 
-ROSWrapper::ROSWrapper(const rclcpp::NodeOptions& options)
-: rclcpp::Node("super_lio", options)
+ROSWrapper::ROSWrapper(const rclcpp::NodeOptions& options, bool localization)
+: rclcpp::Node("super_lio", options), localization_(localization)
 {
   LoadParamFromRos(*this);
+  if (localization_) {
+    g_update_map = g_save_map = g_enable_keyframe_pub = g_enable_backend = false;
+    g_visual_map = false;
+    setupLocalization();
+  }
   LOG(INFO) << GREEN << " ---> Using Lidar type: "
             << lidarTypeToString(g_lidar_type) << RESET;
 
@@ -425,6 +430,12 @@ void ROSWrapper::setupIO(){
                        (was == req->data ? " (unchanged)" : "");
       });
 
+  if (localization_) {
+    pub_odom_ = create_publisher<nav_msgs::msg::Odometry>("hikari_loc/odom", 10);
+    pub_path_ = create_publisher<nav_msgs::msg::Path>("hikari_loc/path", 10);
+    tf_broadcaster_ = std::make_shared<tf2_ros::TransformBroadcaster>(this);
+    return;
+  }
   /// output ======================================
   pub_odom_ = this->create_publisher<nav_msgs::msg::Odometry>(
       "/lio/odom", 100);
@@ -470,6 +481,7 @@ void ROSWrapper::setupIO(){
 
 
 void ROSWrapper::imuHandler(const sensor_msgs::msg::Imu::SharedPtr msg){
+  last_imu_received_ = now().seconds();
   IMUData data;
   data.secs = stampToSec(msg->header.stamp);
   data.acc  = V3(msg->linear_acceleration.x,
@@ -495,6 +507,7 @@ void ROSWrapper::imuHandler(const sensor_msgs::msg::Imu::SharedPtr msg){
 
   DynamicState imu_state, robo_state;
   if(eskf_->Predict(data, imu_state, robo_state)){
+    if (localization_) return;
     nav_msgs::msg::Odometry odom_imu, odom_robo;
 
     {
@@ -546,6 +559,7 @@ void ROSWrapper::imuHandler(const sensor_msgs::msg::Imu::SharedPtr msg){
 void ROSWrapper::livoxHandler(const livox_ros_driver2::msg::CustomMsg::SharedPtr msg){
   if(msg->point_num < 10) return;
   if(!msg->header.frame_id.empty()) lidar_frame_id_ = msg->header.frame_id;
+  last_lidar_received_ = now().seconds();
   LidarData lidar_data;
   std::size_t ptsize = msg->point_num;
   lidar_data.pc.reset(new pcl::PointCloud<LI2Sup::PointXTZIT>());
@@ -575,6 +589,7 @@ void ROSWrapper::stdMsgHandler(const sensor_msgs::msg::PointCloud2::SharedPtr ms
   if(msg->data.size() < 10) return;
   if(!msg->header.frame_id.empty()) lidar_frame_id_ = msg->header.frame_id;
 
+  last_lidar_received_ = now().seconds();
   LidarData lidar_data;
   lidar_data.pc.reset(new pcl::PointCloud<LI2Sup::PointXTZIT>());
 
@@ -773,6 +788,7 @@ bool ROSWrapper::sync_measure(MeasureGroup& meas){
 
 
 void ROSWrapper::pub_odom(const NavState& state){
+  if (localization_) { publishLocalization(state); return; }
   nav_msgs::msg::Odometry odom;
   odom.header.frame_id = "world";
 
@@ -1057,7 +1073,12 @@ void ROSWrapper::pub_processing_time(double time,
 
 void ROSWrapper::set_global_map(const BASIC::CloudPtr& global_map){
   pcl::toROSMsg(*global_map, global_map_msg_);
-  global_map_msg_.header.frame_id = "world";
+  global_map_msg_.header.frame_id = localization_ ? map_frame_ : "world";
+  if (localization_) {
+    global_map_msg_.header.stamp = now();
+    global_map_pub_->publish(global_map_msg_);
+    return;
+  }
 
   static auto global_map_pub =
     this->create_publisher<sensor_msgs::msg::PointCloud2>(
@@ -1088,7 +1109,8 @@ void ROSWrapper::set_global_map(const BASIC::CloudPtr& global_map){
 
 void ROSWrapper::set_initial_data(BASIC::SE3& init_pose, bool& flg_get_init_guess, bool flg_finish_init)
 {
-  static auto init_pose_sub =
+  if (flg_finish_init && localization_) return;
+  init_pose_sub_ =
     this->create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
         "/initialpose", 1,
         [this, &init_pose, &flg_get_init_guess](
@@ -1097,7 +1119,7 @@ void ROSWrapper::set_initial_data(BASIC::SE3& init_pose, bool& flg_get_init_gues
           V3 init_translation;
           init_translation << msg->pose.pose.position.x,
                               msg->pose.pose.position.y,
-                              0.2;
+                              localization_ ? msg->pose.pose.position.z : 0.2;
 
           double x = msg->pose.pose.orientation.x;
           double y = msg->pose.pose.orientation.y;
@@ -1105,6 +1127,13 @@ void ROSWrapper::set_initial_data(BASIC::SE3& init_pose, bool& flg_get_init_gues
           double w = msg->pose.pose.orientation.w;
 
           Quat init_rotation(w, x, y, z);
+          if (!init_translation.allFinite() || !init_rotation.coeffs().allFinite() ||
+              init_rotation.norm() < 1e-6 ||
+              (localization_ && !msg->header.frame_id.empty() && msg->header.frame_id != map_frame_)) {
+            RCLCPP_WARN(get_logger(), "Rejected invalid initialpose or non-map frame");
+            return;
+          }
+          init_rotation.normalize();
 
           init_pose = BASIC::SE3(SO3(init_rotation.toRotationMatrix()), init_translation);
 
@@ -1121,7 +1150,7 @@ void ROSWrapper::set_initial_data(BASIC::SE3& init_pose, bool& flg_get_init_gues
         });
 
   if (flg_finish_init) {
-    init_pose_sub.reset();
+    init_pose_sub_.reset();
   }
 }
 

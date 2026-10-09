@@ -34,14 +34,14 @@ public:
     data_wrapper_ = wrapper;
   }
   virtual void init();
-  void process();
+  virtual void process();
   void saveMap();
   void printTimeRecord();
 
   /// Return to the pre-init state: empty map, fresh filter, cleared buffers.
   /// Used when the node is re-activated so a new session estimates gravity and
   /// bias from scratch instead of inheriting the previous session's.
-  void Reset();
+  virtual void Reset();
 
 protected:
   void stateWaitKFInit();

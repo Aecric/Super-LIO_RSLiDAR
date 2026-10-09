@@ -152,3 +152,7 @@ We kindly recommend to cite [our paper](https://ieeexplore.ieee.org/document/113
   - Add support for RoboSense M1/Airy LiDAR (`robosense_airy.yaml` / `robosense_airy.py`).
 
 </details>
+
+## 固定地图纯定位
+
+新增与 hikari_loclite 在线命令及核心 topic / TF 对齐的 `run_loclite_online`，使用已有 `global.pcd`，运行期间不更新或保存地图。构建、配置、初始化和接口说明见 [纯定位文档](docs/localization.md)。
