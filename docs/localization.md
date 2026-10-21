@@ -39,7 +39,7 @@ ros2 topic pub --once /initialpose geometry_msgs/msg/PoseWithCovarianceStamped \
 
 `/initialpose` 的 z 和完整四元数都会保留；非法数值、零四元数、非地图 frame 会被拒绝。运行中可再次发送初值，暂停输出并重新验证。`lio.relocation.init_pose` 是旧重定位入口的配置，纯定位模式使用 `/initialpose`。
 
-`/super_lio/set_active` 服务可停用/启用传感器订阅；重新启用后重新发送 `/initialpose`，固定地图仍保留。有效匹配不足或输入掉线后停止发布跟踪位姿，转入等待初值恢复流程。
+`~/set_active` 服务可停用/启用传感器订阅（`loclite.launch.py` 启动时节点名为 `super_lio_loc`，即 `/super_lio_loc/set_active`；`ros2 run` 直接启动时为 `/super_lio/set_active`，与同样用 `ros2 run` 启动的建图节点同名，同时运行时需用 `--ros-args -r __node:=<name>` 改名）；重新启用后重新发送 `/initialpose`，固定地图仍保留。有效匹配不足或输入掉线后停止发布跟踪位姿，转入等待初值恢复流程。
 
 ## 输出约定
 

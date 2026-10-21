@@ -14,7 +14,8 @@ def launch_node(context):
     if map_path:
         arguments += ['--map_path', map_path]
     return [Node(
-        package='super_lio', executable='run_loclite_online', output='screen',
+        package='super_lio', executable='run_loclite_online', name='super_lio_loc',
+        output='screen',
         arguments=arguments,
         parameters=[{'use_sim_time': ParameterValue(
             LaunchConfiguration('use_sim_time'), value_type=bool)}])]
