@@ -30,6 +30,22 @@ find_package(Eigen3 REQUIRED NO_MODULE)
 find_package(PCL REQUIRED)
 find_package(Glog REQUIRED)
 find_package(basic REQUIRED)
+find_package(TBB REQUIRED)
+
+# Fixed-map relocalization: KISS-Matcher (prior-free global registration) is
+# built from the vendored source; its ROBIN dependency is fetched at configure
+# time. Never pick up a robin/kiss_matcher left in a shared install prefix by
+# another package (lightning-lm / hikari_loclite vendor the same libraries).
+if(NOT TARGET kiss_matcher::kiss_matcher_core)
+  set(USE_SYSTEM_TBB ON CACHE BOOL "Use system TBB for KISS-Matcher" FORCE)
+  set(USE_SYSTEM_ROBIN OFF CACHE BOOL "Fetch ROBIN for KISS-Matcher" FORCE)
+  # Static KISS/ROBIN archives end up inside the shared liblio.
+  set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+  add_subdirectory(
+    ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/KISS-Matcher/cpp/kiss_matcher
+    ${CMAKE_BINARY_DIR}/_deps/kiss_matcher-build
+    EXCLUDE_FROM_ALL)
+endif()
 
 
 rosidl_generate_interfaces(${PROJECT_NAME}
@@ -55,7 +71,14 @@ include_directories(
 file(GLOB_RECURSE LIO_LIB_SRC "src/lio/*.cpp" "src/ros/*.cpp")
 file(GLOB_RECURSE LIO_LIB_HEADERS "include/lio/*.hpp" "include/lio/*.h")
 
-add_library(lio ${LIO_LIB_SRC} ${LIO_LIB_HEADERS})
+# GenZ-ICP core (refinement against the fixed map), vendored with Sophus and tsl.
+set(GENZ_ICP_SRC
+  thirdparty/genz_icp/genz_icp/VoxelHashMap.cpp
+  thirdparty/genz_icp/genz_icp/Registration.cpp
+)
+
+add_library(lio ${LIO_LIB_SRC} ${LIO_LIB_HEADERS} ${GENZ_ICP_SRC})
+target_include_directories(lio PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/genz_icp)
 
 target_link_libraries(lio PUBLIC
   Eigen3::Eigen
@@ -74,6 +97,9 @@ target_link_libraries(lio PUBLIC
   glog
   pthread
   ${cpp_typesupport_target}
+  PRIVATE
+  kiss_matcher::kiss_matcher_core
+  TBB::tbb
 )
 
 add_executable(super_lio_node src/apps/super_lio_node.cpp)
@@ -125,5 +151,28 @@ install(DIRECTORY config/
 install(DIRECTORY rviz/
   DESTINATION share/${PROJECT_NAME}/rviz
 )
+
+# KISS-Matcher and its fetched ROBIN/PMC/xenium carry their own install rules,
+# which would put static libs, headers and CMake exports into the prefix and
+# collide in dpkg with lightning-lm / hikari_loclite shipping the same files.
+# Everything is linked statically, so drop them after the subtree installed.
+# DESTDIR-aware, multiarch-libdir-aware, exact paths only.
+include(GNUInstallDirs)
+string(CONFIGURE [[
+  set(_super_lio_strip_root "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}")
+  file(REMOVE_RECURSE
+    "${_super_lio_strip_root}/@CMAKE_INSTALL_INCLUDEDIR@/kiss_matcher"
+    "${_super_lio_strip_root}/@CMAKE_INSTALL_INCLUDEDIR@/robin"
+    "${_super_lio_strip_root}/@CMAKE_INSTALL_INCLUDEDIR@/pmc"
+    "${_super_lio_strip_root}/@CMAKE_INSTALL_INCLUDEDIR@/xenium"
+    "${_super_lio_strip_root}/@CMAKE_INSTALL_LIBDIR@/cmake/kiss_matcher"
+    "${_super_lio_strip_root}/@CMAKE_INSTALL_LIBDIR@/cmake/robin"
+    "${_super_lio_strip_root}/@CMAKE_INSTALL_LIBDIR@/cmake/pmc"
+    "${_super_lio_strip_root}/@CMAKE_INSTALL_LIBDIR@/cmake/xenium"
+    "${_super_lio_strip_root}/@CMAKE_INSTALL_LIBDIR@/libkiss_matcher_core.a"
+    "${_super_lio_strip_root}/@CMAKE_INSTALL_LIBDIR@/librobin.a"
+    "${_super_lio_strip_root}/@CMAKE_INSTALL_LIBDIR@/libpmc.a")
+]] _super_lio_strip_code @ONLY)
+install(CODE "${_super_lio_strip_code}")
 
 ament_package()

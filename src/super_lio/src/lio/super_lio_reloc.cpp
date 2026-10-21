@@ -10,6 +10,9 @@
 #include <pcl/registration/icp.h>
 #include <pcl/registration/ndt.h>
 #include <pcl/kdtree/kdtree_flann.h>
+#include <pcl/filters/voxel_grid.h>
+
+#include <chrono>
 
 
 using namespace BASIC;
@@ -97,6 +100,34 @@ void SuperLIOReLoc::init(){
   LOG(INFO) << GREEN << " ---> [SuperLIO]: Map init success. Time: "
             << duration.count() << " ms." << RESET;
 
+  if (data_wrapper_->localization()) {
+    const auto& options = data_wrapper_->relocOptions();
+    start_time = std::chrono::high_resolution_clock::now();
+    ndt_.reset(new pcl::NormalDistributionsTransform<PointType, PointType>());
+    ndt_->setTransformationEpsilon(1e-4);
+    ndt_->setMaximumIterations(25);
+    ndt_->setResolution(1.0);
+    ndt_->setInputTarget(point_map_);
+    genz_ = std::make_unique<GenzRefiner>(options.genz);
+    fc_ = std::make_unique<FcGate>(options.fc);
+    if (!genz_->SetTarget(point_map_) || !fc_->SetTarget(point_map_)) {
+      LOG(ERROR) << RED << " ---> [Reloc]: GenZ/FC target init failed." << RESET;
+      g_flag_run = false;
+      return;
+    }
+    if (options.cold_start.enable) {
+      kiss_ = std::make_unique<KissGlobalMatcher>(options.kiss);
+      if (!kiss_->SetTarget(point_map_)) kiss_.reset();
+    }
+    duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::high_resolution_clock::now() - start_time);
+    LOG(INFO) << GREEN << " ---> [Reloc]: targets ready in " << duration.count()
+              << " ms; cold start " << (!options.cold_start.enable ? "off" :
+                                        options.origin_prior.enable ? (kiss_ ? "origin prior + KISS" : "origin prior")
+                                                                    : (kiss_ ? "KISS" : "off"))
+              << RESET;
+  }
+
   state_fn_ = &SuperLIOReLoc::stateWaitKFInit;
   // The localization map is already loaded into ivox_.  Mark the initial
   // activation as consumed so SuperLIO::process() does not immediately call
@@ -115,7 +146,15 @@ void SuperLIOReLoc::Reset() {
   init_frame_count_ = 0;
   init_obs_data_->clear();
   has_init_pose_ = false;
+  cold_start_attempts_ = 0;
   if (data_wrapper_->localization()) data_wrapper_->setLocState(5);
+}
+
+bool SuperLIOReLoc::coldStartArmed() const {
+  const auto& options = data_wrapper_->relocOptions();
+  const int max_attempts = options.cold_start.max_attempts;
+  return options.cold_start.enable && (kiss_ || options.origin_prior.enable) &&
+         (max_attempts == 0 || cold_start_attempts_ < max_attempts);
 }
 
 void SuperLIOReLoc::process() {
@@ -188,7 +227,13 @@ bool SuperLIOReLoc::kf_init(){
     return false;
   }
 
-  if (data_wrapper_->localization() && !has_init_pose_) return false;
+  if (data_wrapper_->localization() && !has_init_pose_) {
+    if (!coldStartArmed()) return false;
+    if (data_wrapper_->locState() != 1) {
+      LOG(INFO) << YELLOW << " ---> [Reloc] cold start: keep still, accumulating" << RESET;
+      data_wrapper_->setLocState(1);
+    }
+  }
 
   CloudPtr point_cloud_pcl = CloudPtr(new PointCloudType());
   for(std::size_t i = 0; i < measures_.lidar.pc->size(); i++){
@@ -241,51 +286,65 @@ bool SuperLIOReLoc::kf_init(){
 
 
   if (data_wrapper_->localization()) {
-    // /initialpose denotes map<-lidar, while registration source is in IMU.
-    init_guess_T = (re_init_pose_ * g_lidar_imu.inverse()).matrix();
-  }
+    const bool manual = has_init_pose_;
+    const bool aligned = alignToMap(manual, rot, init_guess_T);
+    data_wrapper_->resetInputWatchdog();
+    if (!aligned) {
+      imu_cout = 0;
+      init_frame_count = 0;
+      init_obs_data_->clear();
+      mean_gyro = V3::Zero();
+      mean_acce = V3::Zero();
+      if (!manual && !coldStartArmed()) {
+        LOG(WARNING) << RED << " ---> [Reloc] cold start gave up after " << cold_start_attempts_
+                     << " attempts; waiting for /initialpose" << RESET;
+        data_wrapper_->setLocState(5);
+      }
+      return false;
+    }
+  } else {
+    pcl::PointCloud<pcl::PointXYZI>::Ptr tmp_src(new pcl::PointCloud<pcl::PointXYZI>());
+    pcl::transformPointCloud(*init_obs_data_, *tmp_src, g_lidar_imu.matrix().cast<float>());
 
-  pcl::PointCloud<pcl::PointXYZI>::Ptr tmp_src(new pcl::PointCloud<pcl::PointXYZI>());
-  pcl::transformPointCloud(*init_obs_data_, *tmp_src, g_lidar_imu.matrix().cast<float>());
+    pcl::NormalDistributionsTransform<pcl::PointXYZI, pcl::PointXYZI> ndt;
+    ndt.setTransformationEpsilon(1e-4);
+    ndt.setEuclideanFitnessEpsilon(1e-4);
+    ndt.setMaximumIterations(25);
+    ndt.setResolution(1.0);
+    ndt.setInputTarget(point_map_);
 
-  pcl::NormalDistributionsTransform<pcl::PointXYZI, pcl::PointXYZI> ndt;
-  ndt.setTransformationEpsilon(1e-4);
-  ndt.setEuclideanFitnessEpsilon(1e-4);
-  ndt.setMaximumIterations(25);
-  ndt.setResolution(1.0);
-  ndt.setInputTarget(point_map_);
+    pcl::IterativeClosestPoint<pcl::PointXYZI, pcl::PointXYZI> icp;
+    icp.setMaxCorrespondenceDistance(4.0);
+    icp.setMaximumIterations(40);
+    icp.setTransformationEpsilon(1e-4);
+    icp.setEuclideanFitnessEpsilon(1e-4);
+    icp.setRANSACIterations(0);
+    icp.setInputTarget(point_map_);
 
-  pcl::IterativeClosestPoint<pcl::PointXYZI, pcl::PointXYZI> icp;
-  icp.setMaxCorrespondenceDistance(4.0);
-  icp.setMaximumIterations(40);
-  icp.setTransformationEpsilon(1e-4);
-  icp.setEuclideanFitnessEpsilon(1e-4);
-  icp.setRANSACIterations(0);
-  icp.setInputTarget(point_map_);
+    ndt.setInputSource(tmp_src);
+    icp.setInputSource(tmp_src);
 
-  ndt.setInputSource(tmp_src);
-  icp.setInputSource(tmp_src);
+    pcl::PointCloud<pcl::PointXYZI>::Ptr unused_result(new pcl::PointCloud<pcl::PointXYZI>());
+    ndt.align(*unused_result, init_guess_T.matrix().cast<float>());
+    icp.align(*unused_result, ndt.getFinalTransformation());
 
-  pcl::PointCloud<pcl::PointXYZI>::Ptr unused_result(new pcl::PointCloud<pcl::PointXYZI>());
-  ndt.align(*unused_result, init_guess_T.matrix().cast<float>());
-  icp.align(*unused_result, ndt.getFinalTransformation());
-
-  if (!ndt.hasConverged() || !icp.hasConverged() ||
-      !icp.getFinalTransformation().allFinite() || !std::isfinite(icp.getFitnessScore()) ||
-      icp.getFitnessScore() > 1.5)
-  // if (icp.hasConverged() == false)
-  {
-    /// reset init state.
-    imu_cout = 0;
-    init_frame_count = 0;
-    init_obs_data_->clear();
-    mean_gyro = V3::Zero();
-    mean_acce = V3::Zero();
-    LOG(INFO) << RED << " ---> Global ICP Converged Fail! FitnessScore: " << icp.getFitnessScore() << RESET;
-    return false;
-  } else{
-    init_guess_T = icp.getFinalTransformation().cast<scalar>();
-    LOG(INFO) << GREEN << " ---> Global ICP Converged Succeed! FitnessScore: " << icp.getFitnessScore() << RESET;
+    if (!ndt.hasConverged() || !icp.hasConverged() ||
+        !icp.getFinalTransformation().allFinite() || !std::isfinite(icp.getFitnessScore()) ||
+        icp.getFitnessScore() > 1.5)
+    // if (icp.hasConverged() == false)
+    {
+      /// reset init state.
+      imu_cout = 0;
+      init_frame_count = 0;
+      init_obs_data_->clear();
+      mean_gyro = V3::Zero();
+      mean_acce = V3::Zero();
+      LOG(INFO) << RED << " ---> Global ICP Converged Fail! FitnessScore: " << icp.getFitnessScore() << RESET;
+      return false;
+    } else{
+      init_guess_T = icp.getFinalTransformation().cast<scalar>();
+      LOG(INFO) << GREEN << " ---> Global ICP Converged Succeed! FitnessScore: " << icp.getFitnessScore() << RESET;
+    }
   }
 
   LOG(INFO) << GREEN << "\n" << init_guess_T << RESET;
@@ -315,6 +374,128 @@ bool SuperLIOReLoc::kf_init(){
 
   if (data_wrapper_->localization()) data_wrapper_->setLocState(2);
   return true;
+}
+
+
+bool SuperLIOReLoc::alignToMap(bool manual, const M3& level_rot, M4& T_map_imu) {
+  const auto& options = data_wrapper_->relocOptions();
+  const auto start = std::chrono::steady_clock::now();
+  auto elapsed = [&start]() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start).count();
+  };
+
+  CloudPtr src_imu(new PointCloudType());
+  pcl::transformPointCloud(*init_obs_data_, *src_imu, g_lidar_imu.matrix().cast<float>());
+  CloudPtr query(new PointCloudType());
+  {
+    const float leaf = static_cast<float>(options.genz.source_voxel);
+    pcl::VoxelGrid<PointType> grid;
+    grid.setLeafSize(leaf, leaf, leaf);
+    grid.setInputCloud(src_imu);
+    grid.filter(*query);
+  }
+
+  Eigen::Matrix4d T;
+  Selection selection = Selection::kNone;
+  if (manual) {
+    // /initialpose denotes map<-lidar, while the query is in IMU.
+    selection = selectCandidate(
+        query, {(re_init_pose_ * g_lidar_imu.inverse()).matrix().cast<double>()},
+        options.fc.max_delta_trans_manual, options.fc.max_delta_rot_deg_manual, 1, "initialpose", T);
+  } else {
+    ++cold_start_attempts_;
+    Eigen::Matrix4d T_level_imu = Eigen::Matrix4d::Identity();
+    T_level_imu.block<3, 3>(0, 0) = level_rot.cast<double>();
+
+    const auto& origin = options.origin_prior;
+    if (origin.enable) {
+      std::vector<Eigen::Matrix4d> guesses;
+      for (double yaw = 0; yaw < 360.0 - 1e-6; yaw += origin.yaw_step_deg) {
+        Eigen::Matrix4d T_map_level = Eigen::Matrix4d::Identity();
+        T_map_level.block<3, 3>(0, 0) =
+            Eigen::AngleAxisd(yaw * M_PI / 180.0, Eigen::Vector3d::UnitZ()).toRotationMatrix();
+        T_map_level.block<3, 1>(0, 3) = Eigen::Vector3d(origin.x, origin.y, origin.z);
+        guesses.push_back(T_map_level * T_level_imu);
+      }
+      selection = selectCandidate(query, guesses, origin.max_delta_trans,
+                                  origin.yaw_step_deg / 2 + 10.0, 1, "origin", T);
+    }
+    // An ambiguous scene stays ambiguous for KISS: retry with the next window.
+    if (selection == Selection::kNone && kiss_) {
+      CloudPtr level(new PointCloudType());
+      pcl::transformPointCloud(*src_imu, *level, T_level_imu.cast<float>());
+      std::vector<Eigen::Matrix4d> guesses;
+      for (const auto& kiss : kiss_->Match(level))
+        if (kiss.valid) guesses.push_back(kiss.T_map_query * T_level_imu);
+      selection = selectCandidate(query, guesses, options.fc.max_delta_trans_kiss,
+                                  options.fc.max_delta_rot_deg_kiss,
+                                  static_cast<std::size_t>(options.kiss.min_agreeing_candidates),
+                                  "kiss", T);
+    }
+  }
+
+  if (selection != Selection::kAccepted) {
+    LOG(WARNING) << RED << " ---> [FC-Init] " << (manual ? "initialpose" : "cold start attempt ")
+                 << (manual ? std::string() : std::to_string(cold_start_attempts_))
+                 << " failed (" << elapsed() << " ms)" << RESET;
+    return false;
+  }
+  LOG(INFO) << GREEN << " ---> [FC-Init] accepted (" << elapsed() << " ms)" << RESET;
+  T_map_imu = T.cast<scalar>();
+  return true;
+}
+
+
+SuperLIOReLoc::Selection SuperLIOReLoc::selectCandidate(
+    const CloudPtr& query, const std::vector<Eigen::Matrix4d>& guesses, double max_delta_trans,
+    double max_delta_rot_deg, std::size_t min_passed, const char* label, Eigen::Matrix4d& T_map_imu) {
+  const auto& options = data_wrapper_->relocOptions();
+  struct Passed {
+    Eigen::Matrix4d T;
+    FcGate::Report report;
+  };
+  std::vector<Passed> passed;
+  for (std::size_t i = 0; i < guesses.size(); ++i) {
+    // NDT widens the basin before GenZ-ICP: hand-placed, origin and KISS
+    // guesses can be a metre or more and 10-20 degrees off.
+    Eigen::Matrix4d refined = guesses[i];
+    CloudPtr unused(new PointCloudType());
+    ndt_->setInputSource(query);
+    ndt_->align(*unused, guesses[i].cast<float>());
+    const Eigen::Matrix4d coarse = ndt_->getFinalTransformation().cast<double>();
+    if (ndt_->hasConverged() && coarse.allFinite()) refined = coarse;
+    FcGate::Report report;
+    if (genz_->Refine(query, refined, refined))
+      report = fc_->Check(query, guesses[i], refined, max_delta_trans, max_delta_rot_deg);
+    const Eigen::Vector3d t = refined.block<3, 1>(0, 3);
+    LOG(INFO) << (report.pass ? GREEN : RED) << " ---> [FC-Init] " << label << " candidate "
+              << i + 1 << "/" << guesses.size() << (report.pass ? " PASS" : " REJECT")
+              << " t=[" << t.transpose() << "]: " << report.Describe() << RESET;
+    if (report.pass) passed.push_back({refined, report});
+  }
+  if (passed.empty()) return Selection::kNone;
+
+  const auto best = std::max_element(passed.begin(), passed.end(), [](const auto& a, const auto& b) {
+    return a.report.wall_inlier_ratio < b.report.wall_inlier_ratio;
+  });
+  for (const auto& other : passed) {
+    const double dt = (other.T.block<3, 1>(0, 3) - best->T.block<3, 1>(0, 3)).norm();
+    const double dr = Eigen::AngleAxisd(Eigen::Matrix3d(
+        best->T.block<3, 3>(0, 0).transpose() * other.T.block<3, 3>(0, 0))).angle() * 180.0 / M_PI;
+    if (dt > options.fc.ambiguity_trans || dr > options.fc.ambiguity_rot_deg) {
+      LOG(WARNING) << RED << " ---> [FC-Init] " << label << ": ambiguous, passing candidates "
+                   << dt << " m / " << dr << " deg apart" << RESET;
+      return Selection::kAmbiguous;
+    }
+  }
+  if (passed.size() < min_passed) {
+    LOG(WARNING) << RED << " ---> [FC-Init] " << label << ": " << passed.size()
+                 << " passing candidate(s), need " << min_passed << " that agree" << RESET;
+    return Selection::kNone;
+  }
+  T_map_imu = best->T;
+  return Selection::kAccepted;
 }
 
 
