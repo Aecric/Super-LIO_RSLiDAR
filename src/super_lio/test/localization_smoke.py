@@ -24,6 +24,24 @@ from std_srvs.srv import SetBool
 from tf2_msgs.msg import TFMessage
 
 
+# Three offset planes constrain all six pose dimensions.
+POINTS = [p for a in range(-20, 21) for b in range(-10, 21)
+          for p in ((4.0, a * .13, b * .13), (a * .13, 3.5, b * .13), (a * .13, b * .13, -.8))]
+YAW = .3
+C, S = math.cos(YAW), math.sin(YAW)
+
+
+def write_map(directory):
+    """Fixed map = the scan seen from map<-lidar (2, -1, .6, yaw .3)."""
+    world = [(C*x-S*y+2, S*x+C*y-1, z+.6) for x, y, z in POINTS]
+    map_file = Path(directory) / 'global.pcd'
+    map_file.write_text('VERSION .7\nFIELDS x y z intensity\nSIZE 4 4 4 4\n'
+                        'TYPE F F F F\nCOUNT 1 1 1 1\n'
+                        f'WIDTH {len(world)}\nHEIGHT 1\nPOINTS {len(world)}\nDATA ascii\n' +
+                        ''.join(f'{x} {y} {z} 10\n' for x, y, z in world))
+    return map_file
+
+
 class LocalizationSmoke(unittest.TestCase):
     def test_launch_map_override(self):
         share = Path(get_package_share_directory('super_lio'))
@@ -58,26 +76,15 @@ class LocalizationSmoke(unittest.TestCase):
         self.assertNotEqual(subprocess.run([executable, '--config', config, '--map_path',
                                            '/nonexistent/super-lio-map'], capture_output=True).returncode, 0)
         with tempfile.TemporaryDirectory(prefix='super-lio-loc-test-') as directory:
-            # Three offset planes constrain all six pose dimensions.
-            points = []
-            for a in range(-20, 21):
-                for b in range(-10, 21):
-                    points.extend([(4.0, a * .13, b * .13),
-                                   (a * .13, 3.5, b * .13),
-                                   (a * .13, b * .13, -.8)])
-            yaw = .3
-            c, s = math.cos(yaw), math.sin(yaw)
-            world = [(c*x-s*y+2, s*x+c*y-1, z+.6) for x, y, z in points]
-            map_file = Path(directory) / 'global.pcd'
-            map_file.write_text('VERSION .7\nFIELDS x y z intensity\nSIZE 4 4 4 4\n'
-                                'TYPE F F F F\nCOUNT 1 1 1 1\n'
-                                f'WIDTH {len(world)}\nHEIGHT 1\nPOINTS {len(world)}\nDATA ascii\n' +
-                                ''.join(f'{x} {y} {z} 10\n' for x, y, z in world))
+            points, yaw, c, s = POINTS, YAW, C, S
+            map_file = write_map(directory)
             original = map_file.read_bytes()
             log = open(Path(directory) / 'node.log', 'w+')
+            # This session covers the /initialpose workflow; cold start has its own test.
             process = subprocess.Popen([executable, '--config='+config, '--map_path='+directory,
                                        '--ros-args', '-p', 'system.base_frame_id:=base_link',
-                                       '-p', 'system.base_to_lidar_x:=0.4'],
+                                       '-p', 'system.base_to_lidar_x:=0.4',
+                                       '-p', 'reloc.cold_start.enable:=false'],
                                        stdout=log, stderr=log)
             rclpy.init()
             node = rclpy.create_node('localization_smoke')
@@ -175,6 +182,72 @@ class LocalizationSmoke(unittest.TestCase):
                 self.assertTrue(4 in states[-15:] or 5 in states[-15:], 'watchdog must leave GOOD')
                 self.assertEqual(map_file.read_bytes(), original)
                 self.assertEqual(list(Path(directory).glob('*.pcd')), [map_file])
+            except Exception:
+                log.flush()
+                log.seek(0)
+                print(log.read()[-12000:])
+                raise
+            finally:
+                node.destroy_node()
+                rclpy.shutdown()
+                process.send_signal(signal.SIGINT)
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+                log.close()
+
+    def test_cold_start_origin_prior(self):
+        """No /initialpose: the origin prior (set to the true spot) localizes."""
+        executable = str(Path(get_package_prefix('super_lio')) / 'lib/super_lio/run_loclite_online')
+        config = str(Path(get_package_share_directory('super_lio')) / 'config/loclite_livox.yaml')
+        with tempfile.TemporaryDirectory(prefix='super-lio-cold-test-') as directory:
+            write_map(directory)
+            log = open(Path(directory) / 'node.log', 'w+')
+            process = subprocess.Popen([executable, '--config='+config, '--map_path='+directory,
+                                       '--ros-args', '-p', 'reloc.origin_prior.x:=2.0',
+                                       '-p', 'reloc.origin_prior.y:=-1.0',
+                                       '-p', 'reloc.origin_prior.z:=0.6',
+                                       # The corner scene is 90-degree symmetric: one yaw hypothesis.
+                                       '-p', 'reloc.origin_prior.yaw_step_deg:=360.0'],
+                                       stdout=log, stderr=log)
+            rclpy.init()
+            node = rclpy.create_node('cold_start_smoke')
+            odoms, states = [], []
+            node.create_subscription(Odometry, '/hikari_loc/odom', odoms.append, 10)
+            node.create_subscription(Int32, '/hikari_loc/loc_state', lambda msg: states.append(msg.data), 10)
+            imu_pub = node.create_publisher(Imu, '/livox/imu', 50)
+            lidar_pub = node.create_publisher(CustomMsg, '/livox/lidar', 10)
+            try:
+                end = time.monotonic() + 15
+                counter = 0
+                while time.monotonic() < end and not odoms:
+                    self.assertIsNone(process.poll(), 'localization node exited')
+                    stamp = node.get_clock().now().to_msg()
+                    imu = Imu()
+                    imu.header.stamp = stamp
+                    imu.linear_acceleration.z = 9.7946
+                    imu_pub.publish(imu)
+                    if counter % 5 == 0:
+                        scan = CustomMsg()
+                        scan.header.stamp = stamp
+                        scan.point_num = len(POINTS)
+                        scan.points = [CustomPoint(x=float(x), y=float(y), z=float(z),
+                            reflectivity=10, tag=0, line=0,
+                            offset_time=int(i * 50_000_000 / len(POINTS)))
+                            for i, (x, y, z) in enumerate(POINTS)]
+                        lidar_pub.publish(scan)
+                    counter += 1
+                    rclpy.spin_once(node, timeout_sec=.01)
+                    time.sleep(.01)
+                self.assertTrue(odoms, 'cold start should localize without /initialpose')
+                self.assertIn(1, states)
+                pose = odoms[-1].pose.pose
+                self.assertAlmostEqual(pose.position.x, 2., delta=.15)
+                self.assertAlmostEqual(pose.position.y, -1., delta=.15)
+                self.assertAlmostEqual(pose.position.z, .6, delta=.15)
+                self.assertAlmostEqual(2 * math.atan2(pose.orientation.z, pose.orientation.w), YAW, delta=.05)
             except Exception:
                 log.flush()
                 log.seek(0)

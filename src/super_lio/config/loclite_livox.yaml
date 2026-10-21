@@ -81,3 +81,50 @@
     runtime.publish_path: true
     runtime.imu_timeout_sec: 1.0
     runtime.lidar_timeout_sec: 2.0
+
+    # Initialization against the fixed map (keep the device still while it runs).
+    #   /initialpose: guess -> NDT -> GenZ-ICP -> FC
+    #   no initial pose (startup / after LOST): cold start
+    #     1. map origin with yaw hypotheses -> NDT -> GenZ-ICP -> FC
+    #     2. if none passes: KISS-Matcher candidates -> NDT -> GenZ-ICP -> FC
+    # An /initialpose received at any time takes over from the cold start.
+    reloc.cold_start.enable: true
+    reloc.cold_start.max_attempts: 0          # 0 = keep retrying until /initialpose
+    reloc.origin_prior.enable: true
+    reloc.origin_prior.x: 0.0                 # IMU position where the device usually starts
+    reloc.origin_prior.y: 0.0
+    reloc.origin_prior.z: 0.0
+    reloc.origin_prior.yaw_step_deg: 45.0
+    reloc.origin_prior.max_delta_trans: 3.0
+    reloc.kiss.voxel_sizes: [0.25, 0.3, 0.4]  # one KISS run (= one candidate) per size
+    reloc.kiss.use_quatro: true               # yaw + translation only
+    reloc.kiss.target_pre_voxel: 0.2
+    reloc.kiss.max_target_points: 800000
+    reloc.kiss.min_rotation_inliers: 0        # FC is the real gate
+    reloc.kiss.min_final_inliers: 0
+    reloc.kiss.min_agreeing_candidates: 2     # passing KISS candidates that must agree
+    reloc.kiss.max_tilt_deg: 10.0
+    reloc.genz.map_voxel: 0.3
+    reloc.genz.max_points_per_voxel: 1
+    reloc.genz.planarity_threshold: 0.1
+    reloc.genz.source_voxel: 0.2
+    reloc.genz.max_iterations: 100
+    reloc.genz.convergence: 0.0001
+    reloc.genz.coarse_max_corr: 1.0
+    reloc.genz.fine_max_corr: 0.3
+    # FC false-positive barrier: all checks must pass.
+    reloc.fc.map_voxel: 0.1
+    reloc.fc.inlier_dist: 0.3
+    reloc.fc.min_inlier_ratio: 0.85
+    reloc.fc.wall_band_min: -0.5              # wall band relative to the sensor height
+    reloc.fc.wall_band_max: 1.0
+    reloc.fc.min_wall_inlier_ratio: 0.8
+    reloc.fc.min_coverage: 0.5                # of observed 45-degree sectors
+    reloc.fc.min_sector_points: 10
+    reloc.fc.max_rmse: 0.08
+    reloc.fc.max_delta_trans_manual: 5.0
+    reloc.fc.max_delta_rot_deg_manual: 45.0
+    reloc.fc.max_delta_trans_kiss: 3.0
+    reloc.fc.max_delta_rot_deg_kiss: 30.0
+    reloc.fc.ambiguity_trans: 1.0             # passing candidates further apart -> reject all
+    reloc.fc.ambiguity_rot_deg: 10.0

@@ -9,3 +9,4 @@ install
 src/CMakeLists.txt
 *map*
 !src/super_lio_loop_backend/include/super_lio_loop_backend/upstream/voxel_map.hpp
+!src/super_lio/thirdparty/**/robin_map.h

@@ -1,4 +1,5 @@
 #include "ros/ROSWrapper.h"
+#include <algorithm>
 #include <filesystem>
 #include <limits>
 #include <stdexcept>
@@ -44,6 +45,58 @@ void ROSWrapper::setupLocalization() {
   publish_path_ = declare_parameter<bool>("runtime.publish_path", true);
   imu_timeout_ = declare_parameter<double>("runtime.imu_timeout_sec", 1.0);
   lidar_timeout_ = declare_parameter<double>("runtime.lidar_timeout_sec", 2.0);
+  auto& r = reloc_options_;
+  r.cold_start.enable = declare_parameter<bool>("reloc.cold_start.enable", r.cold_start.enable);
+  r.cold_start.max_attempts = declare_parameter<int>("reloc.cold_start.max_attempts", r.cold_start.max_attempts);
+  r.origin_prior.enable = declare_parameter<bool>("reloc.origin_prior.enable", r.origin_prior.enable);
+  r.origin_prior.x = declare_parameter<double>("reloc.origin_prior.x", r.origin_prior.x);
+  r.origin_prior.y = declare_parameter<double>("reloc.origin_prior.y", r.origin_prior.y);
+  r.origin_prior.z = declare_parameter<double>("reloc.origin_prior.z", r.origin_prior.z);
+  r.origin_prior.yaw_step_deg = declare_parameter<double>("reloc.origin_prior.yaw_step_deg", r.origin_prior.yaw_step_deg);
+  r.origin_prior.max_delta_trans = declare_parameter<double>("reloc.origin_prior.max_delta_trans", r.origin_prior.max_delta_trans);
+  r.kiss.voxel_sizes = declare_parameter<std::vector<double>>("reloc.kiss.voxel_sizes", r.kiss.voxel_sizes);
+  r.kiss.use_quatro = declare_parameter<bool>("reloc.kiss.use_quatro", r.kiss.use_quatro);
+  r.kiss.target_pre_voxel = declare_parameter<double>("reloc.kiss.target_pre_voxel", r.kiss.target_pre_voxel);
+  r.kiss.max_target_points = static_cast<std::size_t>(declare_parameter<int>(
+      "reloc.kiss.max_target_points", static_cast<int>(r.kiss.max_target_points)));
+  r.kiss.min_rotation_inliers = static_cast<std::size_t>(declare_parameter<int>(
+      "reloc.kiss.min_rotation_inliers", static_cast<int>(r.kiss.min_rotation_inliers)));
+  r.kiss.min_final_inliers = static_cast<std::size_t>(declare_parameter<int>(
+      "reloc.kiss.min_final_inliers", static_cast<int>(r.kiss.min_final_inliers)));
+  r.kiss.min_agreeing_candidates = declare_parameter<int>("reloc.kiss.min_agreeing_candidates", r.kiss.min_agreeing_candidates);
+  r.kiss.max_tilt_deg = declare_parameter<double>("reloc.kiss.max_tilt_deg", r.kiss.max_tilt_deg);
+  r.genz.map_voxel = declare_parameter<double>("reloc.genz.map_voxel", r.genz.map_voxel);
+  r.genz.max_points_per_voxel = declare_parameter<int>("reloc.genz.max_points_per_voxel", r.genz.max_points_per_voxel);
+  r.genz.planarity_threshold = declare_parameter<double>("reloc.genz.planarity_threshold", r.genz.planarity_threshold);
+  r.genz.source_voxel = declare_parameter<double>("reloc.genz.source_voxel", r.genz.source_voxel);
+  r.genz.max_iterations = declare_parameter<int>("reloc.genz.max_iterations", r.genz.max_iterations);
+  r.genz.convergence = declare_parameter<double>("reloc.genz.convergence", r.genz.convergence);
+  r.genz.coarse_max_corr = declare_parameter<double>("reloc.genz.coarse_max_corr", r.genz.coarse_max_corr);
+  r.genz.fine_max_corr = declare_parameter<double>("reloc.genz.fine_max_corr", r.genz.fine_max_corr);
+  r.fc.map_voxel = declare_parameter<double>("reloc.fc.map_voxel", r.fc.map_voxel);
+  r.fc.inlier_dist = declare_parameter<double>("reloc.fc.inlier_dist", r.fc.inlier_dist);
+  r.fc.min_inlier_ratio = declare_parameter<double>("reloc.fc.min_inlier_ratio", r.fc.min_inlier_ratio);
+  r.fc.wall_band_min = declare_parameter<double>("reloc.fc.wall_band_min", r.fc.wall_band_min);
+  r.fc.wall_band_max = declare_parameter<double>("reloc.fc.wall_band_max", r.fc.wall_band_max);
+  r.fc.min_wall_inlier_ratio = declare_parameter<double>("reloc.fc.min_wall_inlier_ratio", r.fc.min_wall_inlier_ratio);
+  r.fc.min_coverage = declare_parameter<double>("reloc.fc.min_coverage", r.fc.min_coverage);
+  r.fc.min_sector_points = declare_parameter<int>("reloc.fc.min_sector_points", r.fc.min_sector_points);
+  r.fc.max_rmse = declare_parameter<double>("reloc.fc.max_rmse", r.fc.max_rmse);
+  r.fc.max_delta_trans_manual = declare_parameter<double>("reloc.fc.max_delta_trans_manual", r.fc.max_delta_trans_manual);
+  r.fc.max_delta_rot_deg_manual = declare_parameter<double>("reloc.fc.max_delta_rot_deg_manual", r.fc.max_delta_rot_deg_manual);
+  r.fc.max_delta_trans_kiss = declare_parameter<double>("reloc.fc.max_delta_trans_kiss", r.fc.max_delta_trans_kiss);
+  r.fc.max_delta_rot_deg_kiss = declare_parameter<double>("reloc.fc.max_delta_rot_deg_kiss", r.fc.max_delta_rot_deg_kiss);
+  r.fc.ambiguity_trans = declare_parameter<double>("reloc.fc.ambiguity_trans", r.fc.ambiguity_trans);
+  r.fc.ambiguity_rot_deg = declare_parameter<double>("reloc.fc.ambiguity_rot_deg", r.fc.ambiguity_rot_deg);
+  const bool kiss_voxels_ok = !r.kiss.voxel_sizes.empty() &&
+      std::all_of(r.kiss.voxel_sizes.begin(), r.kiss.voxel_sizes.end(), [](double v) { return v >= 0.05; });
+  if (r.cold_start.max_attempts < 0 || !kiss_voxels_ok ||
+      r.origin_prior.yaw_step_deg <= 0 || r.origin_prior.yaw_step_deg > 360 ||
+      r.origin_prior.max_delta_trans <= 0 || r.kiss.min_agreeing_candidates < 1 || r.genz.map_voxel <= 0 ||
+      r.genz.max_points_per_voxel < 1 || r.genz.max_iterations < 1 || r.genz.coarse_max_corr <= 0 ||
+      r.genz.fine_max_corr <= 0 || r.fc.map_voxel <= 0 || r.fc.inlier_dist <= 0 ||
+      r.fc.wall_band_min >= r.fc.wall_band_max || r.fc.min_sector_points < 1)
+    throw std::runtime_error("Invalid reloc.* parameters");
   if (g_filter_rate < 1 || g_pub_step < 1 || g_ivox_resolution <= 0 ||
       g_voxel_fliter_size <= 0 || g_kf_max_iterations < 1 ||
       imu_timeout_ <= 0 || lidar_timeout_ <= 0)

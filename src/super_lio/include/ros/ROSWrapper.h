@@ -46,6 +46,7 @@
 #include "common/ds.h"
 
 #include "lio/ESKF.h"
+#include "lio/reloc/reloc_options.h"
 #include "OctVoxMap/OctVoxMap.hpp"
 
 
@@ -83,6 +84,14 @@ public:
   bool localization() const { return localization_; }
   void setLocState(int state) { loc_state_ = state; }
   int locState() const { return loc_state_; }
+  const RelocOptions& relocOptions() const { return reloc_options_; }
+  /// Relocalization blocks the executor for seconds; restart the input
+  /// watchdog afterwards so the stall is not mistaken for a sensor dropout.
+  void resetInputWatchdog() {
+    const double time = now().seconds();
+    if (last_imu_received_ >= 0) last_imu_received_ = time;
+    if (last_lidar_received_ >= 0) last_lidar_received_ = time;
+  }
   void pub_odom(const NavState&);
 
   void pub_cloud_world(const BASIC::CloudPtr& pc, double time);
@@ -125,6 +134,7 @@ private:
   void publishLocStatus();
   bool localization_ = false;
   int loc_state_ = 5;
+  RelocOptions reloc_options_;
   std::string map_frame_ = "map", loc_lidar_frame_ = "livox_frame";
   std::string base_frame_ = "livox_frame", level_frame_ = "level_frame";
   BASIC::SE3 lidar_base_;
