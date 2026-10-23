@@ -147,6 +147,10 @@ void SuperLIOReLoc::Reset() {
   init_obs_data_->clear();
   has_init_pose_ = false;
   cold_start_attempts_ = 0;
+  moving_windows_ = 0;
+  zupt_active_ = false;
+  verify_left_ = 0;
+  verify_failed_ = false;
   if (data_wrapper_->localization()) data_wrapper_->setLocState(5);
 }
 
@@ -162,9 +166,117 @@ void SuperLIOReLoc::process() {
     if (flg_get_init_guess_ && kf_->init_) Reset();
     // Once tracking is lost, require a validated new initial pose.
     if (data_wrapper_->locState() == 4 && kf_->init_) Reset();
+    // A pose that failed its verification window is discarded the same way.
+    if (verify_failed_) Reset();
   }
   SuperLIO::process();
 }
+
+SuperLIOReLoc::ImuStats SuperLIOReLoc::imuStats(int count, const V3& mean_gyro, const V3& mean_acce,
+                                                const V3& m2_gyro, const V3& m2_acce) {
+  ImuStats stats;
+  if (count < 2 || !mean_acce.allFinite() || mean_acce.norm() < 1e-3) return stats;
+  stats.gyro_mean = mean_gyro.norm();
+  stats.gyro_std = std::sqrt(m2_gyro.sum() / count);
+  // Raw accelerometer units vary by driver (g on Livox): scale to m/s^2.
+  stats.acc_std = std::sqrt(m2_acce.sum() / count) * g_gravity_norm / mean_acce.norm();
+  stats.valid = std::isfinite(stats.gyro_mean) && std::isfinite(stats.gyro_std) && std::isfinite(stats.acc_std);
+  return stats;
+}
+
+bool SuperLIOReLoc::imuStill(const ImuStats& stats) const {
+  const auto& still = data_wrapper_->relocOptions().still;
+  return stats.valid && stats.gyro_mean <= still.max_gyro_mean && stats.gyro_std <= still.max_gyro_std &&
+         stats.acc_std <= still.max_acc_std;
+}
+
+static const char* cmdStateName(ROSWrapper::CmdState state) {
+  return state == ROSWrapper::CmdState::kIdle ? "idle" : state == ROSWrapper::CmdState::kMoving ? "moving" : "unknown";
+}
+
+bool SuperLIOReLoc::initWindowStill(int imu_count, const V3& mean_gyro, const V3& mean_acce) {
+  const auto& options = data_wrapper_->relocOptions();
+  if (!options.still_gate) return true;
+  const auto stats = imuStats(imu_count, mean_gyro, mean_acce, init_m2_gyro_, init_m2_acce_);
+  // Let the existing gravity check reject a window without usable IMU data.
+  if (!stats.valid) return true;
+  const auto cmd = data_wrapper_->cmdState();
+  const bool still_ok = cmd != ROSWrapper::CmdState::kMoving && imuStill(stats);
+  const auto& still = options.still;
+  if (still_ok) {
+    LOG(INFO) << GREEN << " ---> [Reloc] init window still: cmd " << cmdStateName(cmd) << ", gyro_mean="
+              << stats.gyro_mean << " gyro_std=" << stats.gyro_std << " rad/s, acc_std=" << stats.acc_std
+              << " m/s^2" << RESET;
+    moving_windows_ = 0;
+  } else if (moving_windows_++ % 10 == 0) {
+    LOG(WARNING) << RED << " ---> [Reloc] device moving, init window discarded (" << moving_windows_
+                 << " so far): cmd " << cmdStateName(cmd) << ", gyro_mean=" << stats.gyro_mean << " (max "
+                 << still.max_gyro_mean << "), gyro_std=" << stats.gyro_std << " (max " << still.max_gyro_std
+                 << ") rad/s, acc_std=" << stats.acc_std << " (max " << still.max_acc_std << ") m/s^2" << RESET;
+  }
+  return still_ok;
+}
+
+void SuperLIOReLoc::onMeasure() {
+  const auto& options = data_wrapper_->relocOptions();
+  frame_still_ = false;
+  if (!data_wrapper_->localization() || !kf_->init_) {
+    zupt_active_ = false;
+    return;
+  }
+  int count = 0;
+  V3 mean_gyro = V3::Zero(), mean_acce = V3::Zero(), m2_gyro = V3::Zero(), m2_acce = V3::Zero();
+  for (const auto& imu : measures_.imu) {
+    ++count;
+    const V3 d_gyro = imu.gyr - mean_gyro;
+    const V3 d_acce = imu.acc - mean_acce;
+    mean_gyro += d_gyro / count;
+    mean_acce += d_acce / count;
+    m2_gyro += d_gyro.cwiseProduct(imu.gyr - mean_gyro);
+    m2_acce += d_acce.cwiseProduct(imu.acc - mean_acce);
+  }
+  const auto stats = imuStats(count, mean_gyro, mean_acce, m2_gyro, m2_acce);
+  // Unlike the init gate, ZUPT never runs on IMU alone: it needs an idle command.
+  const auto cmd = data_wrapper_->cmdState();
+  frame_still_ = cmd == ROSWrapper::CmdState::kIdle && imuStill(stats);
+  const bool still = options.zupt.enable && frame_still_;
+  if (still) kf_->SetZeroVelocityObs(options.zupt.velocity_sigma);
+  if (still != zupt_active_) {
+    zupt_active_ = still;
+    const auto v = kf_->GetNavState().v;
+    LOG(INFO) << (still ? GREEN : YELLOW) << " ---> [ZUPT] " << (still ? "on" : "off") << ": cmd "
+              << cmdStateName(cmd) << ", gyro_mean=" << stats.gyro_mean << " gyro_std=" << stats.gyro_std
+              << " rad/s, acc_std=" << stats.acc_std << " m/s^2, |v|=" << v.norm() << " m/s" << RESET;
+  }
+}
+
+
+bool SuperLIOReLoc::verifyScan(const NavState& state, std::size_t matched) {
+  const auto& verify = data_wrapper_->relocOptions().verify;
+  const std::size_t scan_points = ds_undistort_->size();
+  const double ratio = scan_points > 0 ? static_cast<double>(matched) / scan_points : 0.0;
+  // Drift only means something while the robot has stood still since acceptance.
+  verify_all_still_ = verify_all_still_ && frame_still_;
+  const double drift = (state.p - verify_anchor_).norm();
+  const double speed = state.v.norm();
+  verify_min_ratio_ = std::min(verify_min_ratio_, ratio);
+  verify_max_drift_ = std::max(verify_max_drift_, drift);
+  verify_max_speed_ = std::max(verify_max_speed_, speed);
+  LOG(INFO) << " ---> [Verify] scan " << verify.frames - verify_left_ + 1 << "/" << verify.frames << ": match "
+            << matched << "/" << scan_points << " (" << ratio << "), drift " << drift << " m"
+            << (verify_all_still_ ? " still" : "") << ", |v| " << speed << " m/s";
+  const char* reason = ratio < verify.min_match_ratio                          ? "match ratio"
+                       : verify_all_still_ && drift > verify.max_still_drift   ? "drift while still"
+                       : speed > verify.max_speed                              ? "speed"
+                                                                               : nullptr;
+  if (!reason) return true;
+  LOG(WARNING) << RED << " ---> [Verify] failed (" << reason << "): match " << ratio << " (min "
+               << verify.min_match_ratio << "), drift " << drift << " m (max " << verify.max_still_drift
+               << (verify_all_still_ ? ", still" : ", moving: not checked") << "), |v| " << speed << " m/s (max "
+               << verify.max_speed << "); pose discarded, initializing again" << RESET;
+  return false;
+}
+
 
 bool SuperLIOReLoc::map_init(){
   if(map_loaded_) return true;
@@ -253,8 +365,16 @@ bool SuperLIOReLoc::kf_init(){
 
   for(auto& imu: measures_.imu){
     imu_cout ++;
-    mean_gyro += (imu.gyr - mean_gyro) / imu_cout;
-    mean_acce += (imu.acc - mean_acce) / imu_cout;
+    if (imu_cout == 1) {
+      init_m2_gyro_.setZero();
+      init_m2_acce_.setZero();
+    }
+    const V3 d_gyro = imu.gyr - mean_gyro;
+    const V3 d_acce = imu.acc - mean_acce;
+    mean_gyro += d_gyro / imu_cout;
+    mean_acce += d_acce / imu_cout;
+    init_m2_gyro_ += d_gyro.cwiseProduct(imu.gyr - mean_gyro);
+    init_m2_acce_ += d_acce.cwiseProduct(imu.acc - mean_acce);
   }
 
   if(imu_cout < 20){
@@ -262,6 +382,16 @@ bool SuperLIOReLoc::kf_init(){
   }
 
   if(init_frame_count < need_init_frames){
+    return false;
+  }
+
+  // The filter starts at zero velocity: never initialize from a moving window.
+  if (data_wrapper_->localization() && !initWindowStill(imu_cout, mean_gyro, mean_acce)) {
+    imu_cout = 0;
+    init_frame_count = 0;
+    init_obs_data_->clear();
+    mean_gyro = V3::Zero();
+    mean_acce = V3::Zero();
     return false;
   }
 
@@ -372,7 +502,18 @@ bool SuperLIOReLoc::kf_init(){
     data_wrapper_->set_initial_data(re_init_pose_, flg_get_init_guess_, true);
   }
 
-  if (data_wrapper_->localization()) data_wrapper_->setLocState(2);
+  if (data_wrapper_->localization()) {
+    // Not GOOD yet: the first scans after the alignment stall must confirm the pose.
+    const auto& verify = data_wrapper_->relocOptions().verify;
+    verify_left_ = verify.frames;
+    verify_anchor_ = state.p;
+    verify_all_still_ = true;
+    verify_min_ratio_ = 1.0;
+    verify_max_drift_ = verify_max_speed_ = 0.0;
+    if (verify_left_ > 0)
+      LOG(INFO) << YELLOW << " ---> [Verify] tracking " << verify_left_ << " scans before reporting GOOD" << RESET;
+    data_wrapper_->setLocState(verify_left_ > 0 ? 1 : 2);
+  }
   return true;
 }
 
@@ -535,12 +676,30 @@ void SuperLIOReLoc::Output() {
     for (std::size_t i = 0; i < effect_knn_num_; ++i)
       if (effect_mask_[effect_knn_idxs_[i]]) ++matched;
     if (!state.p.allFinite() || !state.R.R_.allFinite() || matched < 10) {
+      if (data_wrapper_->locState() != 4) {
+        LOG(WARNING) << RED << " ---> [Loc] LOST: "
+                     << (state.p.allFinite() && state.R.R_.allFinite() ? "" : "non-finite state, ")
+                     << "matched " << matched << "/" << effect_knn_num_ << " points (min 10), p=["
+                     << state.p.transpose() << "]" << RESET;
+      }
       data_wrapper_->setLocState(4);
       return;
     }
+    if (verify_left_ > 0) {
+      // Publish nothing until the window passes: downstream must not act on it.
+      if (!verifyScan(state, matched)) {
+        verify_left_ = 0;
+        verify_failed_ = true;
+        return;
+      }
+      if (--verify_left_ > 0) return;
+      LOG(INFO) << GREEN << " ---> [Verify] passed: min match " << verify_min_ratio_ << ", max drift "
+                << verify_max_drift_ << " m" << (verify_all_still_ ? " (still)" : " (moving)")
+                << ", max |v| " << verify_max_speed_ << " m/s" << RESET;
+    }
     data_wrapper_->setLocState(2);
   }
-  data_wrapper_->pub_odom(state);  
+  data_wrapper_->pub_odom(state);
 
   Eigen::Matrix4f transformation = Eigen::Matrix4f::Identity();
   transformation.block<3, 3>(0, 0) = state.R.R_.cast<float>();

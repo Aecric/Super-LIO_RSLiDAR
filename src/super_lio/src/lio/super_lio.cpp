@@ -169,6 +169,7 @@ void SuperLIO::process(){
   if(!data_wrapper_->sync_measure(measures_)){
     return;
   }
+  onMeasure();
   (this->*state_fn_)();
 }
 

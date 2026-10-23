@@ -337,12 +337,19 @@ bool ESKF::UpdateObserve(ESKF::ObsFunc obs) {
     M18 HTRH = M18::Zero();
     HTRH.template block<6,6>(0,0) = HTVH;
 
+    V18 b = V18::Zero();
+    b.template head<6>() = HTVr;
+
+    // ZUPT: z = 0, h(x) = v, H selects v; residual taken at the current iterate.
+    // Must enter HTRH before Qk so gain and covariance see the same information.
+    if (zupt_info_ > 0) {
+      HTRH.template block<3,3>(6,6) += zupt_info_ * M3::Identity();
+      b.template segment<3>(6) -= zupt_info_ * v_;
+    }
+
     // information form
     M18 A = Pk.inverse() + HTRH;
     Qk = A.inverse();
-
-    V18 b = V18::Zero();
-    b.template head<6>() = HTVr;
 
     K_x = Qk * HTRH;
 
@@ -369,6 +376,7 @@ bool ESKF::UpdateObserve(ESKF::ObsFunc obs) {
   P_ = 0.5 * (P_ + P_.transpose());
 
   dx_.setZero();
+  zupt_info_ = 0;
 
   last_obs_time_ = current_obs_time_;
   return true;

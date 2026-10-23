@@ -56,6 +56,8 @@ public:
 
   using ObsFunc = std::function<void(const KFState& kf_state, BASIC::M6& HT_Vinv_H, BASIC::V6& HT_Vinv_r)>;
   bool UpdateObserve(ObsFunc obs);
+  /// Adds a v = 0 observation (std sigma, m/s) to the next UpdateObserve only.
+  void SetZeroVelocityObs(BASIC::scalar sigma) { zupt_info_ = 1 / (sigma * sigma); }
 
   double GetTime() const { return current_time_; }
 
@@ -91,6 +93,7 @@ private:
   
   bool  need_converge_  = true;
   float imu_scale_ = 1.0;
+  BASIC::scalar zupt_info_ = 0;  // ZUPT information (1/sigma^2); 0 = off
   IMUData last_imu_;
   double current_time_ = 0.0;
   double last_imu_time_ = -1.0;
