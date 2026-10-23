@@ -2,6 +2,7 @@
 #define SUPER_LIO_RELOC_OPTIONS_H_
 
 #include <cstddef>
+#include <string>
 #include <vector>
 
 namespace LI2Sup {
@@ -20,6 +21,47 @@ struct RelocOptions {
     // Failed attempts before giving up and waiting for /initialpose. 0 = never.
     int max_attempts = 0;
   } cold_start;
+
+  /// Standstill detection (params still.*), shared by the init gate and ZUPT.
+  /// Still = the commanded velocity has been zero for cmd_hold_sec AND the IMU
+  /// stats are within limits. The robot only moves when commanded, so cmd_vel is
+  /// the primary signal; the loose IMU limits only veto uncommanded motion
+  /// (pushed, bumped). IMU alone cannot tell smooth constant-velocity driving
+  /// from standing still on a quiet chassis.
+  struct Still {
+    // Final command to the chassis (twist_mux output). Empty: no command
+    // source, the init gate falls back to the IMU check and ZUPT is off.
+    std::string cmd_vel_topic = "/cmd_vel";
+    bool cmd_vel_stamped = false;  // geometry_msgs/TwistStamped instead of Twist
+    double cmd_hold_sec = 1.0;     // braking / coasting margin after the last non-zero command
+    double max_gyro_mean = 0.05;   // rad/s, includes the gyro bias
+    double max_gyro_std = 0.03;    // rad/s, norm of per-axis std
+    double max_acc_std = 0.25;     // m/s^2, norm of per-axis std
+  } still;
+
+  /// Initialization assumes zero velocity (cold start and /initialpose): an init
+  /// window that is not still is discarded and accumulated again.
+  bool still_gate = true;
+
+  /// After acceptance the pose is tracked for `frames` scans before GOOD is
+  /// reported (nothing is published meanwhile). The alignment stalls the
+  /// executor for seconds, so these scans are the backlog from the stall: a
+  /// pose that was wrong, or went stale because the robot moved during the
+  /// stall, fails here and initialization starts over. 0 disables.
+  struct Verify {
+    int frames = 10;
+    double min_match_ratio = 0.3;      // matched / downsampled scan points
+    double max_still_drift = 0.15;     // m from the accepted pose, while still throughout
+    double max_speed = 2.0;            // m/s
+  } verify;
+
+  /// Zero-velocity update while tracking and still: v = 0 observation per scan.
+  /// Keeps a weakly constrained direction (corridor axis) from integrating
+  /// velocity noise into position drift while the robot stands.
+  struct Zupt {
+    bool enable = true;
+    double velocity_sigma = 0.02;  // m/s, std of the zero-velocity observation
+  } zupt;
 
   /// Devices usually power up near where the map was started (map origin), so
   /// the cold start first tries that position with a set of yaw hypotheses.

@@ -51,6 +51,21 @@ private:
                             const char* label, Eigen::Matrix4d& T_map_imu);
   bool coldStartArmed() const;
 
+  /// Standstill evidence over a set of IMU samples (Welford sums per axis).
+  struct ImuStats {
+    double gyro_mean = 0, gyro_std = 0, acc_std = 0;  // rad/s, rad/s, m/s^2
+    bool valid = false;
+  };
+  static ImuStats imuStats(int count, const BASIC::V3& mean_gyro, const BASIC::V3& mean_acce,
+                           const BASIC::V3& m2_gyro, const BASIC::V3& m2_acce);
+  bool imuStill(const ImuStats& stats) const;
+  /// Init window: command not moving (unknown falls back to IMU) and IMU still.
+  bool initWindowStill(int imu_count, const BASIC::V3& mean_gyro, const BASIC::V3& mean_acce);
+  /// ZUPT for this scan while tracking: command idle and the scan's IMU still.
+  void onMeasure() override;
+  /// One scan of the post-acceptance window (reloc.verify); false discards the pose.
+  bool verifyScan(const NavState& state, std::size_t matched);
+
 private:
   bool map_loaded_ = false;
   int init_frame_count_ = 0;
@@ -64,6 +79,18 @@ private:
   std::unique_ptr<FcGate> fc_;
   pcl::NormalDistributionsTransform<BASIC::PointType, BASIC::PointType>::Ptr ndt_;
   int cold_start_attempts_ = 0;
+  // Welford sums of squared deviations over the init window (per axis).
+  BASIC::V3 init_m2_gyro_ = BASIC::V3::Zero();
+  BASIC::V3 init_m2_acce_ = BASIC::V3::Zero();
+  int moving_windows_ = 0;
+  bool zupt_active_ = false;
+  bool frame_still_ = false;      // current scan: command idle and IMU still
+  // Post-acceptance verification window.
+  int verify_left_ = 0;
+  bool verify_failed_ = false;
+  bool verify_all_still_ = true;
+  BASIC::V3 verify_anchor_ = BASIC::V3::Zero();
+  double verify_min_ratio_ = 1.0, verify_max_drift_ = 0.0, verify_max_speed_ = 0.0;
 };
 
 } // namespace END.

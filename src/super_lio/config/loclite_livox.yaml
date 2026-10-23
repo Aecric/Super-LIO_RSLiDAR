@@ -90,6 +90,28 @@
     # An /initialpose received at any time takes over from the cold start.
     reloc.cold_start.enable: true
     reloc.cold_start.max_attempts: 0          # 0 = keep retrying until /initialpose
+    # Standstill = commanded velocity zero for cmd_hold_sec AND IMU within the
+    # limits below. cmd_vel is the main signal (the robot only moves when
+    # commanded); the loose IMU limits only veto uncommanded motion (pushed,
+    # bumped). Used by the init gate and by ZUPT.
+    still.cmd_vel_topic: "/cmd_vel"           # twist_mux output; "" = IMU-only gate, ZUPT off
+    still.cmd_vel_stamped: false              # true for geometry_msgs/TwistStamped
+    still.cmd_hold_sec: 1.0                   # braking / coasting margin
+    still.max_gyro_mean: 0.05                 # rad/s (includes bias)
+    still.max_gyro_std: 0.03                  # rad/s
+    still.max_acc_std: 0.25                   # m/s^2
+    # Discard init windows (cold start and /initialpose) that are not still.
+    # A topic without publishers falls back to the IMU check here.
+    reloc.still_gate: true
+    # After acceptance, track this many scans before reporting GOOD (nothing is
+    # published meanwhile); a failing scan discards the pose and initializes again.
+    reloc.verify.frames: 10                   # 0 disables
+    reloc.verify.min_match_ratio: 0.3         # matched / downsampled scan points
+    reloc.verify.max_still_drift: 0.15        # m from the accepted pose, while still throughout
+    reloc.verify.max_speed: 2.0               # m/s
+    # Zero-velocity update while tracking: needs an idle command (never IMU only).
+    zupt.enable: true
+    zupt.velocity_sigma: 0.02                 # m/s
     reloc.origin_prior.enable: true
     reloc.origin_prior.x: 0.0                 # IMU position where the device usually starts
     reloc.origin_prior.y: 0.0

@@ -49,6 +49,8 @@ protected:
   void stateProcess();
   virtual bool kf_init();
   virtual bool map_init();
+  /// Called for every synced measure group before the state function.
+  virtual void onMeasure() {}
   void Propagation_Undistort();
   void DownSample();
   void Observe();

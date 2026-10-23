@@ -346,11 +346,14 @@ void ROSWrapper::createSensorSubscriptions(){
   rclcpp::SubscriptionOptions sub_opt;
   sub_opt.callback_group = cb_sensor_;
 
-  auto imu_qos = rclcpp::QoS(rclcpp::KeepLast(500))
+  // Localization relocalizes on this (single-threaded) executor and stalls it
+  // for several seconds; deep queues (~10 s at 200 Hz IMU / 10 Hz lidar) keep
+  // the stall from dropping the data the verification window then tracks.
+  auto imu_qos = rclcpp::QoS(rclcpp::KeepLast(localization_ ? 2000 : 500))
                  .best_effort()
                  .durability_volatile();
 
-  auto lidar_qos = rclcpp::QoS(rclcpp::KeepLast(20))
+  auto lidar_qos = rclcpp::QoS(rclcpp::KeepLast(localization_ ? 100 : 20))
                    .best_effort()
                    .durability_volatile();
 

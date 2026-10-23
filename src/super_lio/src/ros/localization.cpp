@@ -1,5 +1,6 @@
 #include "ros/ROSWrapper.h"
 #include <algorithm>
+#include <cmath>
 #include <filesystem>
 #include <limits>
 #include <stdexcept>
@@ -48,6 +49,19 @@ void ROSWrapper::setupLocalization() {
   auto& r = reloc_options_;
   r.cold_start.enable = declare_parameter<bool>("reloc.cold_start.enable", r.cold_start.enable);
   r.cold_start.max_attempts = declare_parameter<int>("reloc.cold_start.max_attempts", r.cold_start.max_attempts);
+  r.still.cmd_vel_topic = declare_parameter<std::string>("still.cmd_vel_topic", r.still.cmd_vel_topic);
+  r.still.cmd_vel_stamped = declare_parameter<bool>("still.cmd_vel_stamped", r.still.cmd_vel_stamped);
+  r.still.cmd_hold_sec = declare_parameter<double>("still.cmd_hold_sec", r.still.cmd_hold_sec);
+  r.still.max_gyro_mean = declare_parameter<double>("still.max_gyro_mean", r.still.max_gyro_mean);
+  r.still.max_gyro_std = declare_parameter<double>("still.max_gyro_std", r.still.max_gyro_std);
+  r.still.max_acc_std = declare_parameter<double>("still.max_acc_std", r.still.max_acc_std);
+  r.still_gate = declare_parameter<bool>("reloc.still_gate", r.still_gate);
+  r.verify.frames = declare_parameter<int>("reloc.verify.frames", r.verify.frames);
+  r.verify.min_match_ratio = declare_parameter<double>("reloc.verify.min_match_ratio", r.verify.min_match_ratio);
+  r.verify.max_still_drift = declare_parameter<double>("reloc.verify.max_still_drift", r.verify.max_still_drift);
+  r.verify.max_speed = declare_parameter<double>("reloc.verify.max_speed", r.verify.max_speed);
+  r.zupt.enable = declare_parameter<bool>("zupt.enable", r.zupt.enable);
+  r.zupt.velocity_sigma = declare_parameter<double>("zupt.velocity_sigma", r.zupt.velocity_sigma);
   r.origin_prior.enable = declare_parameter<bool>("reloc.origin_prior.enable", r.origin_prior.enable);
   r.origin_prior.x = declare_parameter<double>("reloc.origin_prior.x", r.origin_prior.x);
   r.origin_prior.y = declare_parameter<double>("reloc.origin_prior.y", r.origin_prior.y);
@@ -91,6 +105,10 @@ void ROSWrapper::setupLocalization() {
   const bool kiss_voxels_ok = !r.kiss.voxel_sizes.empty() &&
       std::all_of(r.kiss.voxel_sizes.begin(), r.kiss.voxel_sizes.end(), [](double v) { return v >= 0.05; });
   if (r.cold_start.max_attempts < 0 || !kiss_voxels_ok ||
+      r.still.cmd_hold_sec < 0 || r.still.max_gyro_mean <= 0 || r.still.max_gyro_std <= 0 ||
+      r.still.max_acc_std <= 0 || r.zupt.velocity_sigma <= 0 || r.verify.frames < 0 ||
+      r.verify.min_match_ratio < 0 || r.verify.min_match_ratio > 1 ||
+      r.verify.max_still_drift <= 0 || r.verify.max_speed <= 0 ||
       r.origin_prior.yaw_step_deg <= 0 || r.origin_prior.yaw_step_deg > 360 ||
       r.origin_prior.max_delta_trans <= 0 || r.kiss.min_agreeing_candidates < 1 || r.genz.map_voxel <= 0 ||
       r.genz.max_points_per_voxel < 1 || r.genz.max_iterations < 1 || r.genz.coarse_max_corr <= 0 ||
@@ -108,6 +126,44 @@ void ROSWrapper::setupLocalization() {
   global_map_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
       "/pcdmap", rclcpp::QoS(1).reliable().transient_local());
   loc_status_timer_ = create_wall_timer(std::chrono::milliseconds(200), [this]() { publishLocStatus(); });
+  setupCmdVel();
+}
+
+void ROSWrapper::setupCmdVel() {
+  const auto& still = reloc_options_.still;
+  if (still.cmd_vel_topic.empty()) {
+    LOG(WARNING) << YELLOW << " ---> [Still] no still.cmd_vel_topic: init gate uses IMU only, ZUPT off" << RESET;
+    return;
+  }
+  // Best effort matches both reliable and best-effort publishers.
+  const auto qos = rclcpp::QoS(rclcpp::KeepLast(10)).best_effort().durability_volatile();
+  // Idle from startup: a robot nobody has commanded yet is standing.
+  last_cmd_motion_ = now().seconds() - still.cmd_hold_sec;
+  auto on_cmd = [this](const geometry_msgs::msg::Twist& twist) {
+    constexpr double kZero = 1e-3;
+    if (std::abs(twist.linear.x) > kZero || std::abs(twist.linear.y) > kZero ||
+        std::abs(twist.angular.z) > kZero)
+      last_cmd_motion_ = now().seconds();
+  };
+  if (still.cmd_vel_stamped)
+    cmd_vel_stamped_sub_ = create_subscription<geometry_msgs::msg::TwistStamped>(
+        still.cmd_vel_topic, qos,
+        [on_cmd](geometry_msgs::msg::TwistStamped::ConstSharedPtr msg) { on_cmd(msg->twist); });
+  else
+    cmd_vel_sub_ = create_subscription<geometry_msgs::msg::Twist>(
+        still.cmd_vel_topic, qos, [on_cmd](geometry_msgs::msg::Twist::ConstSharedPtr msg) { on_cmd(*msg); });
+  LOG(INFO) << GREEN << " ---> [Still] commanded velocity from " << still.cmd_vel_topic
+            << ", hold " << still.cmd_hold_sec << " s" << RESET;
+}
+
+ROSWrapper::CmdState ROSWrapper::cmdState() const {
+  const std::size_t publishers = cmd_vel_sub_ ? cmd_vel_sub_->get_publisher_count()
+                               : cmd_vel_stamped_sub_ ? cmd_vel_stamped_sub_->get_publisher_count() : 0;
+  // twist_mux goes quiet when idle, so silence counts as zero command; but with
+  // nobody on the topic (wrong name, mux down) there is no evidence at all.
+  if (publishers == 0) return CmdState::kUnknown;
+  return now().seconds() - last_cmd_motion_ >= reloc_options_.still.cmd_hold_sec ? CmdState::kIdle
+                                                                                 : CmdState::kMoving;
 }
 
 void ROSWrapper::publishLocalization(const NavState& state) {
@@ -173,7 +229,11 @@ void ROSWrapper::publishLocStatus() {
   const double lidar_age = last_lidar_received_ < 0 ? -1 : std::max(0.0, time - last_lidar_received_);
   if (!is_active()) loc_state_ = 5;
   else if (loc_state_ == 2 && (imu_age < 0 || lidar_age < 0 ||
-           imu_age > imu_timeout_ || lidar_age > lidar_timeout_)) loc_state_ = 4;
+           imu_age > imu_timeout_ || lidar_age > lidar_timeout_)) {
+    loc_state_ = 4;
+    LOG(WARNING) << RED << " ---> [Loc] LOST: sensor timeout, imu_age=" << imu_age << " s (limit " << imu_timeout_
+                 << "), lidar_age=" << lidar_age << " s (limit " << lidar_timeout_ << ")" << RESET;
+  }
   std_msgs::msg::Int32 state;
   state.data = loc_state_;
   loc_state_pub_->publish(state);

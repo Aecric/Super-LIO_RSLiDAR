@@ -6,6 +6,8 @@
 #include <std_msgs/msg/int32.hpp>
 #include <std_msgs/msg/float32_multi_array.hpp>
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
+#include <geometry_msgs/msg/twist.hpp>
+#include <geometry_msgs/msg/twist_stamped.hpp>
 #include <tuple>
 #include <deque>
 #include <atomic>
@@ -85,6 +87,9 @@ public:
   void setLocState(int state) { loc_state_ = state; }
   int locState() const { return loc_state_; }
   const RelocOptions& relocOptions() const { return reloc_options_; }
+  /// Commanded velocity (still.cmd_vel_topic): idle = zero for cmd_hold_sec.
+  enum class CmdState { kIdle, kMoving, kUnknown };
+  CmdState cmdState() const;
   /// Relocalization blocks the executor for seconds; restart the input
   /// watchdog afterwards so the stall is not mistaken for a sensor dropout.
   void resetInputWatchdog() {
@@ -130,6 +135,7 @@ private:
   void stdMsgHandler(const sensor_msgs::msg::PointCloud2::SharedPtr msg);
 
   void setupLocalization();
+  void setupCmdVel();
   void publishLocalization(const NavState& state);
   void publishLocStatus();
   bool localization_ = false;
@@ -148,6 +154,9 @@ private:
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr global_map_pub_;
   rclcpp::TimerBase::SharedPtr loc_status_timer_, global_map_timer_;
   rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr init_pose_sub_;
+  rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_sub_;
+  rclcpp::Subscription<geometry_msgs::msg::TwistStamped>::SharedPtr cmd_vel_stamped_sub_;
+  double last_cmd_motion_ = 0;  // node time of the last non-zero command
   void setupParams();
   void setupIO();
   void createSensorSubscriptions();
