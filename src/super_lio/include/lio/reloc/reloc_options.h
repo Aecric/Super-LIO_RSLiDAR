@@ -63,6 +63,51 @@ struct RelocOptions {
     double velocity_sigma = 0.02;  // m/s, std of the zero-velocity observation
   } zupt;
 
+  /// Pose hold while tracking and standing (params hold.*): the pose of the
+  /// first still scan is held by a strong pose observation. Unmapped things
+  /// moving right next to the sensor while parked (the arm in the door, people)
+  /// otherwise pull the pose, which ZUPT (velocity only) cannot stop. Scans the
+  /// IMU vetoes (arm, door) skip the hold but keep the anchor; any command
+  /// releases it.
+  struct Hold {
+    bool enable = true;
+    double sigma_pos = 0.01;       // m
+    double sigma_rot_deg = 0.2;    // deg
+    // Beyond this from the anchor the robot really moved (pushed during vetoed
+    // scans): re-anchor instead of pulling it back.
+    double max_offset = 0.10;      // m
+    double max_rot_deg = 3.0;      // deg
+  } hold;
+
+  /// Vehicle cloud from target modeling (params vehicle.*), added to the fixed
+  /// map while fresh. The vehicle parks beside the docking points but is not in
+  /// the map, and its long side runs along the driving direction: unmatched, its
+  /// points pull the pose sideways while the map has nothing to hold it along
+  /// the vehicle. In the map, its side and ends constrain both directions.
+  struct Vehicle {
+    bool enable = true;
+    std::string cloud_topic = "/tm/debug_registered_cloud";  // map frame, latched
+    // Published only for a successful run; the cloud topic also carries the raw
+    // accumulation of a failed one, so a cloud is used only with a box of the
+    // same stamp.
+    std::string box_topic = "/tm/box_pose";
+    double timeout_sec = 1800.0;   // removed this long after the modeling stamp
+    int min_points = 200;
+    /// Map update beside the vehicle (vehicle.update.*). The door is opened only
+    /// for the docking, after modeling: while approaching, scan points around
+    /// the vehicle fill empty map cells so the open door is in the map when the
+    /// robot stops in front of it. Collection ends on arrival, before the arm
+    /// reaches in, and the points are dropped once the robot is back.
+    struct Update {
+      bool enable = true;
+      std::string start_topic = "/driverseat_in";        // std_msgs/Bool true: collect
+      std::string stop_topic = "/driverseat_in_done";    // true: stop collecting, keep
+      std::string clear_topic = "/driverseat_out_done";  // true: drop the points
+      double margin = 1.2;      // m around the vehicle footprint (door swing)
+      double min_range = 1.0;   // m from the sensor: robot body and arm never enter
+    } update;
+  } vehicle;
+
   /// Devices usually power up near where the map was started (map origin), so
   /// the cold start first tries that position with a set of yaw hypotheses.
   struct OriginPrior {

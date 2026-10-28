@@ -63,8 +63,18 @@ private:
   bool initWindowStill(int imu_count, const BASIC::V3& mean_gyro, const BASIC::V3& mean_acce);
   /// ZUPT for this scan while tracking: command idle and the scan's IMU still.
   void onMeasure() override;
+  /// Pose hold for this scan (hold.*): anchor while tracking and still.
+  void holdPose(bool cmd_idle);
   /// One scan of the post-acceptance window (reloc.verify); false discards the pose.
   bool verifyScan(const NavState& state, std::size_t matched);
+  /// Localization: rebuild the search index from the fixed map plus extra
+  /// points in the map frame (the modeled vehicle; empty = fixed map only).
+  void rebuildFixedIndex(const BASIC::VV3& extra);
+  /// Vehicle cloud accepted (non-empty) or expired (empty): map and update region.
+  void setVehicle(BASIC::VV3 points, BASIC::scalar yaw);
+  /// Map update beside the vehicle (vehicle.update.*), one scan.
+  void updateVehicleLayer();
+  bool inVehicleRegion(const BASIC::V3& p) const;
 
 private:
   bool map_loaded_ = false;
@@ -85,12 +95,25 @@ private:
   int moving_windows_ = 0;
   bool zupt_active_ = false;
   bool frame_still_ = false;      // current scan: command idle and IMU still
+  // Pose hold anchor and how far the scans tried to pull away from it.
+  bool hold_set_ = false;
+  BASIC::SO3 hold_R_;
+  BASIC::V3 hold_p_ = BASIC::V3::Zero();
+  int hold_scans_ = 0;
+  BASIC::scalar hold_max_offset_ = 0, hold_max_rot_deg_ = 0;
   // Post-acceptance verification window.
   int verify_left_ = 0;
   bool verify_failed_ = false;
   bool verify_all_still_ = true;
   BASIC::V3 verify_anchor_ = BASIC::V3::Zero();
   double verify_min_ratio_ = 1.0, verify_max_drift_ = 0.0, verify_max_speed_ = 0.0;
+  // Modeled vehicle in the map and the region its map update may fill: the
+  // footprint in the box frame (yaw), grown by vehicle.update.margin.
+  BASIC::VV3 vehicle_points_;
+  BASIC::scalar vehicle_cos_ = 1, vehicle_sin_ = 0;
+  BASIC::V3 region_lo_ = BASIC::V3::Zero(), region_hi_ = BASIC::V3::Zero();
+  BASIC::VV3 layer_cloud_;   // points the map update stored, one per sub-voxel filled
+  bool layer_collecting_ = false;
 };
 
 } // namespace END.

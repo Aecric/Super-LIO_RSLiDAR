@@ -112,6 +112,37 @@
     # Zero-velocity update while tracking: needs an idle command (never IMU only).
     zupt.enable: true
     zupt.velocity_sigma: 0.02                 # m/s
+    # Pose hold while tracking and standing: the first still scan's pose is held
+    # (ZUPT only holds velocity; parked at the door, the arm and people next to
+    # the sensor still pulled the pose). IMU-vetoed scans skip it but keep the
+    # anchor; any command releases it.
+    hold.enable: true
+    hold.sigma_pos: 0.01                      # m
+    hold.sigma_rot_deg: 0.2                   # deg
+    hold.max_offset: 0.10                     # m: beyond this the robot moved, re-anchor
+    hold.max_rot_deg: 3.0
+    # Vehicle cloud from target modeling, added to the fixed map. The vehicle is
+    # not in the map; docking beside it, its unmatched long side pulled the pose
+    # sideways and let it slide along the vehicle. A cloud is used only with a
+    # box of the same stamp (failed runs publish the cloud without one); a newer
+    # run replaces it, and it is removed timeout_sec after modeling.
+    vehicle.enable: true
+    vehicle.cloud_topic: "/tm/debug_registered_cloud"   # map frame
+    vehicle.box_topic: "/tm/box_pose"
+    vehicle.timeout_sec: 1800.0
+    vehicle.min_points: 200
+    # Map update beside the vehicle: the door is opened only for the docking,
+    # after modeling, and stands right in front of the robot at C. From the
+    # start command until arrival, tracked scans fill empty map cells around
+    # the vehicle (existing map points are never changed), so the open door is
+    # in the map before the robot stops. Points nearer than min_range (robot,
+    # arm) are never added; the cells are dropped on the clear command.
+    vehicle.update.enable: true
+    vehicle.update.start_topic: "/driverseat_in"         # std_msgs/Bool true
+    vehicle.update.stop_topic: "/driverseat_in_done"
+    vehicle.update.clear_topic: "/driverseat_out_done"
+    vehicle.update.margin: 1.2                # m around the modeled footprint
+    vehicle.update.min_range: 1.0             # m from the sensor
     reloc.origin_prior.enable: true
     reloc.origin_prior.x: 0.0                 # IMU position where the device usually starts
     reloc.origin_prior.y: 0.0

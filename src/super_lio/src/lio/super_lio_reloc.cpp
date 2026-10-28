@@ -13,6 +13,7 @@
 #include <pcl/filters/voxel_grid.h>
 
 #include <chrono>
+#include <limits>
 
 
 using namespace BASIC;
@@ -149,6 +150,7 @@ void SuperLIOReLoc::Reset() {
   cold_start_attempts_ = 0;
   moving_windows_ = 0;
   zupt_active_ = false;
+  hold_set_ = false;
   verify_left_ = 0;
   verify_failed_ = false;
   if (data_wrapper_->localization()) data_wrapper_->setLocState(5);
@@ -162,6 +164,21 @@ bool SuperLIOReLoc::coldStartArmed() const {
 }
 
 void SuperLIOReLoc::process() {
+  if (data_wrapper_->localization() && map_loaded_) {
+    VV3 vehicle;
+    scalar yaw = 0;
+    if (data_wrapper_->takeVehicleUpdate(vehicle, yaw)) {
+      if (vehicle.empty())
+        LOG(INFO) << YELLOW << " ---> [Vehicle] cloud expired, removed from the map" << RESET;
+      setVehicle(std::move(vehicle), yaw);
+    }
+    if (data_wrapper_->takeVehicleLayerClear() && !layer_cloud_.empty()) {
+      LOG(INFO) << YELLOW << " ---> [Vehicle] map update: " << layer_cloud_.size() << " cells dropped" << RESET;
+      rebuildFixedIndex(vehicle_points_);
+      layer_cloud_.clear();
+      data_wrapper_->pubVehicleLayer(layer_cloud_);
+    }
+  }
   if (data_wrapper_->localization() && data_wrapper_->is_active()) {
     if (flg_get_init_guess_ && kf_->init_) Reset();
     // Once tracking is lost, require a validated new initial pose.
@@ -222,6 +239,7 @@ void SuperLIOReLoc::onMeasure() {
   frame_still_ = false;
   if (!data_wrapper_->localization() || !kf_->init_) {
     zupt_active_ = false;
+    hold_set_ = false;
     return;
   }
   int count = 0;
@@ -248,6 +266,44 @@ void SuperLIOReLoc::onMeasure() {
               << cmdStateName(cmd) << ", gyro_mean=" << stats.gyro_mean << " gyro_std=" << stats.gyro_std
               << " rad/s, acc_std=" << stats.acc_std << " m/s^2, |v|=" << v.norm() << " m/s" << RESET;
   }
+  holdPose(cmd == ROSWrapper::CmdState::kIdle);
+}
+
+void SuperLIOReLoc::holdPose(bool cmd_idle) {
+  const auto& hold = data_wrapper_->relocOptions().hold;
+  // Only on a verified, tracked pose: holding an unverified one would mask a
+  // wrong acceptance.
+  if (!hold.enable || !cmd_idle || data_wrapper_->locState() != 2) {
+    if (hold_set_) {
+      LOG(INFO) << YELLOW << " ---> [Hold] released after " << hold_scans_ << " scans; max offset from the anchor "
+                << hold_max_offset_ << " m, " << hold_max_rot_deg_ << " deg" << RESET;
+    }
+    hold_set_ = false;
+    return;
+  }
+  // IMU-vetoed scans (arm, door, someone leaning on it) skip the hold, anchor kept.
+  if (!frame_still_) return;
+  const auto state = kf_->GetNavState();
+  const scalar offset = (state.p - hold_p_).norm();
+  const scalar rot_deg = (hold_R_.inverse() * state.R).log_vee().norm() * 180.0 / M_PI;
+  if (hold_set_ && (offset > hold.max_offset || rot_deg > hold.max_rot_deg)) {
+    LOG(WARNING) << YELLOW << " ---> [Hold] " << offset << " m, " << rot_deg
+                 << " deg from the anchor: the robot moved, anchoring again" << RESET;
+    hold_set_ = false;
+  }
+  if (!hold_set_) {
+    hold_set_ = true;
+    hold_R_ = state.R;
+    hold_p_ = state.p;
+    hold_scans_ = 0;
+    hold_max_offset_ = hold_max_rot_deg_ = 0;
+    LOG(INFO) << GREEN << " ---> [Hold] anchored at p=[" << state.p.transpose() << "]" << RESET;
+  } else {
+    hold_max_offset_ = std::max(hold_max_offset_, offset);
+    hold_max_rot_deg_ = std::max(hold_max_rot_deg_, rot_deg);
+  }
+  ++hold_scans_;
+  kf_->SetPoseObs(hold_R_, hold_p_, hold.sigma_rot_deg * M_PI / 180.0, hold.sigma_pos);
 }
 
 
@@ -293,19 +349,14 @@ bool SuperLIOReLoc::map_init(){
 
   if (point_map_->empty()) return false;
 
-  VV3 point_map_v3;
-  point_map_v3.reserve(point_map_->size());
-  for(const auto& point: *point_map_){
-    V3 pt(point.x, point.y, point.z);
-    point_map_v3.push_back(pt);
-  }
-
   if (data_wrapper_->localization()) {
-    // No LRU eviction while loading a fixed map, even with a small configured capacity.
-    const auto capacity = std::max(static_cast<std::size_t>(g_ivox_capacity), point_map_v3.size() + 1);
-    ivox_.reset(new OctVoxMapType(OctVoxMapType::Options{g_ivox_resolution, capacity}));
+    rebuildFixedIndex({});
+  } else {
+    VV3 point_map_v3;
+    point_map_v3.reserve(point_map_->size());
+    for (const auto& point : *point_map_) point_map_v3.emplace_back(point.x, point.y, point.z);
+    ivox_->insert(point_map_v3);
   }
-  ivox_->insert(point_map_v3);
 
   LOG(INFO) << GREEN << " ---> Load map success. File: " << map_name << RESET;
   LOG(INFO) << GREEN << " ---> Map size: " << point_map_->size() << RESET;
@@ -316,6 +367,30 @@ bool SuperLIOReLoc::map_init(){
   data_wrapper_->set_global_map(point_map_);
   data_wrapper_->set_initial_data(re_init_pose_, flg_get_init_guess_);
   return true;
+}
+
+
+void SuperLIOReLoc::rebuildFixedIndex(const VV3& extra) {
+  const auto start = std::chrono::steady_clock::now();
+  VV3 points;
+  points.reserve(point_map_->size() + extra.size());
+  for (const auto& point : *point_map_) points.emplace_back(point.x, point.y, point.z);
+  points.insert(points.end(), extra.begin(), extra.end());
+  // No LRU eviction in a fixed map, even with a small configured capacity.
+  // Headroom for the vehicle-side map update, which never evicts.
+  const auto capacity = std::max(static_cast<std::size_t>(g_ivox_capacity), 2 * points.size() + 100000);
+  ivox_.reset(new OctVoxMapType(OctVoxMapType::Options{g_ivox_resolution, capacity}));
+  ivox_->insert(points);
+  if (extra.empty()) return;
+  V3 lo = extra.front(), hi = extra.front();
+  for (const auto& p : extra) {
+    lo = lo.cwiseMin(p);
+    hi = hi.cwiseMax(p);
+  }
+  const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start);
+  LOG(INFO) << GREEN << " ---> [Vehicle] " << extra.size() << " points added to the map, x[" << lo.x() << ", "
+            << hi.x() << "] y[" << lo.y() << ", " << hi.y() << "] z[" << lo.z() << ", " << hi.z() << "] ("
+            << ms.count() << " ms)" << RESET;
 }
 
 
@@ -640,8 +715,64 @@ SuperLIOReLoc::Selection SuperLIOReLoc::selectCandidate(
 }
 
 
+void SuperLIOReLoc::setVehicle(VV3 points, scalar yaw) {
+  vehicle_points_ = std::move(points);
+  rebuildFixedIndex(vehicle_points_);  // also drops a previous vehicle's map update
+  if (!layer_cloud_.empty()) {
+    layer_cloud_.clear();
+    data_wrapper_->pubVehicleLayer(layer_cloud_);
+  }
+  if (vehicle_points_.empty()) return;
+  vehicle_cos_ = std::cos(yaw);
+  vehicle_sin_ = std::sin(yaw);
+  region_lo_ = V3::Constant(std::numeric_limits<scalar>::max());
+  region_hi_ = V3::Constant(std::numeric_limits<scalar>::lowest());
+  for (const auto& p : vehicle_points_) {
+    const V3 box(vehicle_cos_ * p.x() + vehicle_sin_ * p.y(), -vehicle_sin_ * p.x() + vehicle_cos_ * p.y(), p.z());
+    region_lo_ = region_lo_.cwiseMin(box);
+    region_hi_ = region_hi_.cwiseMax(box);
+  }
+  // Doors swing out sideways and stand taller than the modeled band.
+  const scalar margin = data_wrapper_->relocOptions().vehicle.update.margin;
+  region_lo_ -= V3(margin, margin, 0.1);
+  region_hi_ += V3(margin, margin, 0.5);
+}
+
+bool SuperLIOReLoc::inVehicleRegion(const V3& p) const {
+  const V3 box(vehicle_cos_ * p.x() + vehicle_sin_ * p.y(), -vehicle_sin_ * p.x() + vehicle_cos_ * p.y(), p.z());
+  return (box.array() >= region_lo_.array()).all() && (box.array() <= region_hi_.array()).all();
+}
+
+void SuperLIOReLoc::updateVehicleLayer() {
+  const auto& update = data_wrapper_->relocOptions().vehicle.update;
+  const bool collecting = update.enable && !vehicle_points_.empty() && data_wrapper_->vehicleCollecting();
+  if (collecting != layer_collecting_) {
+    layer_collecting_ = collecting;
+    LOG(INFO) << GREEN << " ---> [Vehicle] map update " << (collecting ? "started" : "stopped") << ": "
+              << layer_cloud_.size() << " cells so far" << RESET;
+  }
+  // Only from a tracked pose: a pose that is off would write the error into the
+  // map. Standing still adds no new view, only whatever the pose drifts.
+  if (!collecting || data_wrapper_->locState() != 2 || frame_still_) return;
+  const SE3 pose = kf_->GetSE3();
+  const scalar min_range2 = update.min_range * update.min_range;
+  VV3 points;
+  points.reserve(ds_undistort_->size());
+  for (std::size_t i = 0; i < ds_undistort_->size(); ++i) {
+    const V3& body = points_body_v3_[i];
+    if (body.squaredNorm() < min_range2) continue;
+    const V3 world = pose.R_ * body + pose.t_;
+    if (inVehicleRegion(world)) points.push_back(world);
+  }
+  if (ivox_->insertNew(points, &layer_cloud_) > 0) data_wrapper_->pubVehicleLayer(layer_cloud_);
+}
+
 void SuperLIOReLoc::UpdateMap() {
-  if(data_wrapper_->localization() || !g_update_map) return;
+  if (data_wrapper_->localization()) {
+    updateVehicleLayer();
+    return;
+  }
+  if(!g_update_map) return;
   
   static int __update_delay = 100;
   if(__update_delay > 0){
