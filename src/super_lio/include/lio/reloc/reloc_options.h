@@ -63,6 +63,22 @@ struct RelocOptions {
     double velocity_sigma = 0.02;  // m/s, std of the zero-velocity observation
   } zupt;
 
+  /// Pose hold while tracking and standing (params hold.*): the pose of the
+  /// first still scan is held by a strong pose observation. Unmapped things
+  /// moving right next to the sensor while parked (the arm in the door, people)
+  /// otherwise pull the pose, which ZUPT (velocity only) cannot stop. Scans the
+  /// IMU vetoes (arm, door) skip the hold but keep the anchor; any command
+  /// releases it.
+  struct Hold {
+    bool enable = true;
+    double sigma_pos = 0.01;       // m
+    double sigma_rot_deg = 0.2;    // deg
+    // Beyond this from the anchor the robot really moved (pushed during vetoed
+    // scans): re-anchor instead of pulling it back.
+    double max_offset = 0.10;      // m
+    double max_rot_deg = 3.0;      // deg
+  } hold;
+
   /// Vehicle cloud from target modeling (params vehicle.*), added to the fixed
   /// map while fresh. The vehicle parks beside the docking points but is not in
   /// the map, and its long side runs along the driving direction: unmatched, its

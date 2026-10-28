@@ -58,6 +58,13 @@ public:
   bool UpdateObserve(ObsFunc obs);
   /// Adds a v = 0 observation (std sigma, m/s) to the next UpdateObserve only.
   void SetZeroVelocityObs(BASIC::scalar sigma) { zupt_info_ = 1 / (sigma * sigma); }
+  /// Adds a pose = (R, p) observation (std rad, m) to the next UpdateObserve only.
+  void SetPoseObs(const BASIC::SO3& R, const BASIC::V3& p, BASIC::scalar sigma_rot, BASIC::scalar sigma_pos) {
+    hold_R_ = R;
+    hold_p_ = p;
+    hold_info_rot_ = 1 / (sigma_rot * sigma_rot);
+    hold_info_pos_ = 1 / (sigma_pos * sigma_pos);
+  }
 
   double GetTime() const { return current_time_; }
 
@@ -94,6 +101,10 @@ private:
   bool  need_converge_  = true;
   float imu_scale_ = 1.0;
   BASIC::scalar zupt_info_ = 0;  // ZUPT information (1/sigma^2); 0 = off
+  // Pose hold observation (information 1/sigma^2); 0 = off.
+  BASIC::SO3 hold_R_;
+  BASIC::V3 hold_p_ = BASIC::V3::Zero();
+  BASIC::scalar hold_info_rot_ = 0, hold_info_pos_ = 0;
   IMUData last_imu_;
   double current_time_ = 0.0;
   double last_imu_time_ = -1.0;

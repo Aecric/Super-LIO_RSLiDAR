@@ -150,6 +150,7 @@ void SuperLIOReLoc::Reset() {
   cold_start_attempts_ = 0;
   moving_windows_ = 0;
   zupt_active_ = false;
+  hold_set_ = false;
   verify_left_ = 0;
   verify_failed_ = false;
   if (data_wrapper_->localization()) data_wrapper_->setLocState(5);
@@ -237,6 +238,7 @@ void SuperLIOReLoc::onMeasure() {
   frame_still_ = false;
   if (!data_wrapper_->localization() || !kf_->init_) {
     zupt_active_ = false;
+    hold_set_ = false;
     return;
   }
   int count = 0;
@@ -263,6 +265,44 @@ void SuperLIOReLoc::onMeasure() {
               << cmdStateName(cmd) << ", gyro_mean=" << stats.gyro_mean << " gyro_std=" << stats.gyro_std
               << " rad/s, acc_std=" << stats.acc_std << " m/s^2, |v|=" << v.norm() << " m/s" << RESET;
   }
+  holdPose(cmd == ROSWrapper::CmdState::kIdle);
+}
+
+void SuperLIOReLoc::holdPose(bool cmd_idle) {
+  const auto& hold = data_wrapper_->relocOptions().hold;
+  // Only on a verified, tracked pose: holding an unverified one would mask a
+  // wrong acceptance.
+  if (!hold.enable || !cmd_idle || data_wrapper_->locState() != 2) {
+    if (hold_set_) {
+      LOG(INFO) << YELLOW << " ---> [Hold] released after " << hold_scans_ << " scans; max offset from the anchor "
+                << hold_max_offset_ << " m, " << hold_max_rot_deg_ << " deg" << RESET;
+    }
+    hold_set_ = false;
+    return;
+  }
+  // IMU-vetoed scans (arm, door, someone leaning on it) skip the hold, anchor kept.
+  if (!frame_still_) return;
+  const auto state = kf_->GetNavState();
+  const scalar offset = (state.p - hold_p_).norm();
+  const scalar rot_deg = (hold_R_.inverse() * state.R).log_vee().norm() * 180.0 / M_PI;
+  if (hold_set_ && (offset > hold.max_offset || rot_deg > hold.max_rot_deg)) {
+    LOG(WARNING) << YELLOW << " ---> [Hold] " << offset << " m, " << rot_deg
+                 << " deg from the anchor: the robot moved, anchoring again" << RESET;
+    hold_set_ = false;
+  }
+  if (!hold_set_) {
+    hold_set_ = true;
+    hold_R_ = state.R;
+    hold_p_ = state.p;
+    hold_scans_ = 0;
+    hold_max_offset_ = hold_max_rot_deg_ = 0;
+    LOG(INFO) << GREEN << " ---> [Hold] anchored at p=[" << state.p.transpose() << "]" << RESET;
+  } else {
+    hold_max_offset_ = std::max(hold_max_offset_, offset);
+    hold_max_rot_deg_ = std::max(hold_max_rot_deg_, rot_deg);
+  }
+  ++hold_scans_;
+  kf_->SetPoseObs(hold_R_, hold_p_, hold.sigma_rot_deg * M_PI / 180.0, hold.sigma_pos);
 }
 
 

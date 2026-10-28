@@ -346,6 +346,14 @@ bool ESKF::UpdateObserve(ESKF::ObsFunc obs) {
       HTRH.template block<3,3>(6,6) += zupt_info_ * M3::Identity();
       b.template segment<3>(6) -= zupt_info_ * v_;
     }
+    // Pose hold: z = anchor, R perturbed on the right (Update), so the rotation
+    // residual is Log(R^T R_anchor) and the position residual p_anchor - p.
+    if (hold_info_pos_ > 0) {
+      HTRH.template block<3,3>(0,0) += hold_info_rot_ * M3::Identity();
+      b.template segment<3>(0) += hold_info_rot_ * (R_.inverse() * hold_R_).log_vee();
+      HTRH.template block<3,3>(3,3) += hold_info_pos_ * M3::Identity();
+      b.template segment<3>(3) += hold_info_pos_ * (hold_p_ - p_);
+    }
 
     // information form
     M18 A = Pk.inverse() + HTRH;
@@ -377,6 +385,7 @@ bool ESKF::UpdateObserve(ESKF::ObsFunc obs) {
 
   dx_.setZero();
   zupt_info_ = 0;
+  hold_info_rot_ = hold_info_pos_ = 0;
 
   last_obs_time_ = current_obs_time_;
   return true;

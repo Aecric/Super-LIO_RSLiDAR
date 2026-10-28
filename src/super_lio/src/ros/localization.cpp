@@ -62,6 +62,11 @@ void ROSWrapper::setupLocalization() {
   r.verify.max_speed = declare_parameter<double>("reloc.verify.max_speed", r.verify.max_speed);
   r.zupt.enable = declare_parameter<bool>("zupt.enable", r.zupt.enable);
   r.zupt.velocity_sigma = declare_parameter<double>("zupt.velocity_sigma", r.zupt.velocity_sigma);
+  r.hold.enable = declare_parameter<bool>("hold.enable", r.hold.enable);
+  r.hold.sigma_pos = declare_parameter<double>("hold.sigma_pos", r.hold.sigma_pos);
+  r.hold.sigma_rot_deg = declare_parameter<double>("hold.sigma_rot_deg", r.hold.sigma_rot_deg);
+  r.hold.max_offset = declare_parameter<double>("hold.max_offset", r.hold.max_offset);
+  r.hold.max_rot_deg = declare_parameter<double>("hold.max_rot_deg", r.hold.max_rot_deg);
   r.vehicle.enable = declare_parameter<bool>("vehicle.enable", r.vehicle.enable);
   r.vehicle.cloud_topic = declare_parameter<std::string>("vehicle.cloud_topic", r.vehicle.cloud_topic);
   r.vehicle.box_topic = declare_parameter<std::string>("vehicle.box_topic", r.vehicle.box_topic);
@@ -119,6 +124,7 @@ void ROSWrapper::setupLocalization() {
   if (r.cold_start.max_attempts < 0 || !kiss_voxels_ok ||
       r.still.cmd_hold_sec < 0 || r.still.max_gyro_mean <= 0 || r.still.max_gyro_std <= 0 ||
       r.still.max_acc_std <= 0 || r.zupt.velocity_sigma <= 0 || r.verify.frames < 0 ||
+      r.hold.sigma_pos <= 0 || r.hold.sigma_rot_deg <= 0 || r.hold.max_offset <= 0 || r.hold.max_rot_deg <= 0 ||
       (r.vehicle.enable && (r.vehicle.cloud_topic.empty() || r.vehicle.box_topic.empty() ||
                             r.vehicle.timeout_sec <= 0 || r.vehicle.min_points < 1)) ||
       (r.vehicle.enable && u.enable && (u.start_topic.empty() || u.stop_topic.empty() ||

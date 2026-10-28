@@ -63,6 +63,8 @@ private:
   bool initWindowStill(int imu_count, const BASIC::V3& mean_gyro, const BASIC::V3& mean_acce);
   /// ZUPT for this scan while tracking: command idle and the scan's IMU still.
   void onMeasure() override;
+  /// Pose hold for this scan (hold.*): anchor while tracking and still.
+  void holdPose(bool cmd_idle);
   /// One scan of the post-acceptance window (reloc.verify); false discards the pose.
   bool verifyScan(const NavState& state, std::size_t matched);
   /// Localization: rebuild the search index from the fixed map plus extra
@@ -93,6 +95,12 @@ private:
   int moving_windows_ = 0;
   bool zupt_active_ = false;
   bool frame_still_ = false;      // current scan: command idle and IMU still
+  // Pose hold anchor and how far the scans tried to pull away from it.
+  bool hold_set_ = false;
+  BASIC::SO3 hold_R_;
+  BASIC::V3 hold_p_ = BASIC::V3::Zero();
+  int hold_scans_ = 0;
+  double hold_max_offset_ = 0, hold_max_rot_deg_ = 0;
   // Post-acceptance verification window.
   int verify_left_ = 0;
   bool verify_failed_ = false;
