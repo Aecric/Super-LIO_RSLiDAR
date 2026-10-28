@@ -68,6 +68,11 @@ private:
   /// Localization: rebuild the search index from the fixed map plus extra
   /// points in the map frame (the modeled vehicle; empty = fixed map only).
   void rebuildFixedIndex(const BASIC::VV3& extra);
+  /// Vehicle cloud accepted (non-empty) or expired (empty): map and update region.
+  void setVehicle(BASIC::VV3 points, BASIC::scalar yaw);
+  /// Map update beside the vehicle (vehicle.update.*), one scan.
+  void updateVehicleLayer();
+  bool inVehicleRegion(const BASIC::V3& p) const;
 
 private:
   bool map_loaded_ = false;
@@ -94,6 +99,13 @@ private:
   bool verify_all_still_ = true;
   BASIC::V3 verify_anchor_ = BASIC::V3::Zero();
   double verify_min_ratio_ = 1.0, verify_max_drift_ = 0.0, verify_max_speed_ = 0.0;
+  // Modeled vehicle in the map and the region its map update may fill: the
+  // footprint in the box frame (yaw), grown by vehicle.update.margin.
+  BASIC::VV3 vehicle_points_;
+  BASIC::scalar vehicle_cos_ = 1, vehicle_sin_ = 0;
+  BASIC::V3 region_lo_ = BASIC::V3::Zero(), region_hi_ = BASIC::V3::Zero();
+  std::size_t layer_points_ = 0;   // sub-voxels filled by the map update
+  bool layer_collecting_ = false;
 };
 
 } // namespace END.

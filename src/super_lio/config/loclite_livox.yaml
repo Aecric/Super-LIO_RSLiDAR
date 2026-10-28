@@ -122,6 +122,18 @@
     vehicle.box_topic: "/tm/box_pose"
     vehicle.timeout_sec: 1800.0
     vehicle.min_points: 200
+    # Map update beside the vehicle: the door is opened only for the docking,
+    # after modeling, and stands right in front of the robot at C. From the
+    # start command until arrival, tracked scans fill empty map cells around
+    # the vehicle (existing map points are never changed), so the open door is
+    # in the map before the robot stops. Points nearer than min_range (robot,
+    # arm) are never added; the cells are dropped on the clear command.
+    vehicle.update.enable: true
+    vehicle.update.start_topic: "/driverseat_in"         # std_msgs/Bool true
+    vehicle.update.stop_topic: "/driverseat_in_done"
+    vehicle.update.clear_topic: "/driverseat_out_done"
+    vehicle.update.margin: 1.2                # m around the modeled footprint
+    vehicle.update.min_range: 1.0             # m from the sensor
     reloc.origin_prior.enable: true
     reloc.origin_prior.x: 0.0                 # IMU position where the device usually starts
     reloc.origin_prior.y: 0.0

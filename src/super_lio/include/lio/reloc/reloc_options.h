@@ -77,6 +77,19 @@ struct RelocOptions {
     std::string box_topic = "/tm/box_pose";
     double timeout_sec = 1800.0;   // removed this long after the modeling stamp
     int min_points = 200;
+    /// Map update beside the vehicle (vehicle.update.*). The door is opened only
+    /// for the docking, after modeling: while approaching, scan points around
+    /// the vehicle fill empty map cells so the open door is in the map when the
+    /// robot stops in front of it. Collection ends on arrival, before the arm
+    /// reaches in, and the points are dropped once the robot is back.
+    struct Update {
+      bool enable = true;
+      std::string start_topic = "/driverseat_in";        // std_msgs/Bool true: collect
+      std::string stop_topic = "/driverseat_in_done";    // true: stop collecting, keep
+      std::string clear_topic = "/driverseat_out_done";  // true: drop the points
+      double margin = 1.2;      // m around the vehicle footprint (door swing)
+      double min_range = 1.0;   // m from the sensor: robot body and arm never enter
+    } update;
   } vehicle;
 
   /// Devices usually power up near where the map was started (map origin), so

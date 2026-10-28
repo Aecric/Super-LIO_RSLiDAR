@@ -3,12 +3,14 @@
 #define ROSWRAPPER_HPP_
 
 #include <map>
+#include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/int32.hpp>
 #include <std_msgs/msg/float32_multi_array.hpp>
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #include <geometry_msgs/msg/twist.hpp>
 #include <geometry_msgs/msg/twist_stamped.hpp>
 #include <tuple>
+#include <utility>
 #include <deque>
 #include <atomic>
 #include <vector>
@@ -92,7 +94,11 @@ public:
   CmdState cmdState() const;
   /// Vehicle cloud change for the fixed map (vehicle.*): true once per newly
   /// accepted cloud (points filled) and once when it expires (points empty).
-  bool takeVehicleUpdate(BASIC::VV3& points);
+  bool takeVehicleUpdate(BASIC::VV3& points, BASIC::scalar& yaw);
+  /// Map update beside the vehicle (vehicle.update.*): collecting between the
+  /// start and stop commands; take...Clear() is true once per clear command.
+  bool vehicleCollecting() const { return vehicle_collecting_; }
+  bool takeVehicleLayerClear() { return std::exchange(vehicle_layer_clear_, false); }
   /// Relocalization blocks the executor for seconds; restart the input
   /// watchdog afterwards so the stall is not mistaken for a sensor dropout.
   void resetInputWatchdog() {
@@ -170,6 +176,10 @@ private:
   double vehicle_map_stamp_ = -1;       // stamp of the cloud in the map; -1 = none
   BASIC::VV3 vehicle_pending_;
   bool vehicle_pending_set_ = false;
+  BASIC::scalar vehicle_box_yaw_ = 0, vehicle_pending_yaw_ = 0;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr vehicle_start_sub_, vehicle_stop_sub_, vehicle_clear_sub_;
+  bool vehicle_collecting_ = false;
+  bool vehicle_layer_clear_ = false;
   void setupParams();
   void setupIO();
   void createSensorSubscriptions();
