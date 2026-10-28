@@ -172,10 +172,11 @@ void SuperLIOReLoc::process() {
         LOG(INFO) << YELLOW << " ---> [Vehicle] cloud expired, removed from the map" << RESET;
       setVehicle(std::move(vehicle), yaw);
     }
-    if (data_wrapper_->takeVehicleLayerClear() && layer_points_ > 0) {
-      LOG(INFO) << YELLOW << " ---> [Vehicle] map update: " << layer_points_ << " cells dropped" << RESET;
+    if (data_wrapper_->takeVehicleLayerClear() && !layer_cloud_.empty()) {
+      LOG(INFO) << YELLOW << " ---> [Vehicle] map update: " << layer_cloud_.size() << " cells dropped" << RESET;
       rebuildFixedIndex(vehicle_points_);
-      layer_points_ = 0;
+      layer_cloud_.clear();
+      data_wrapper_->pubVehicleLayer(layer_cloud_);
     }
   }
   if (data_wrapper_->localization() && data_wrapper_->is_active()) {
@@ -717,7 +718,10 @@ SuperLIOReLoc::Selection SuperLIOReLoc::selectCandidate(
 void SuperLIOReLoc::setVehicle(VV3 points, scalar yaw) {
   vehicle_points_ = std::move(points);
   rebuildFixedIndex(vehicle_points_);  // also drops a previous vehicle's map update
-  layer_points_ = 0;
+  if (!layer_cloud_.empty()) {
+    layer_cloud_.clear();
+    data_wrapper_->pubVehicleLayer(layer_cloud_);
+  }
   if (vehicle_points_.empty()) return;
   vehicle_cos_ = std::cos(yaw);
   vehicle_sin_ = std::sin(yaw);
@@ -745,7 +749,7 @@ void SuperLIOReLoc::updateVehicleLayer() {
   if (collecting != layer_collecting_) {
     layer_collecting_ = collecting;
     LOG(INFO) << GREEN << " ---> [Vehicle] map update " << (collecting ? "started" : "stopped") << ": "
-              << layer_points_ << " cells so far" << RESET;
+              << layer_cloud_.size() << " cells so far" << RESET;
   }
   // Only from a tracked pose: a pose that is off would write the error into the
   // map. Standing still adds no new view, only whatever the pose drifts.
@@ -760,7 +764,7 @@ void SuperLIOReLoc::updateVehicleLayer() {
     const V3 world = pose.R_ * body + pose.t_;
     if (inVehicleRegion(world)) points.push_back(world);
   }
-  layer_points_ += ivox_->insertNew(points);
+  if (ivox_->insertNew(points, &layer_cloud_) > 0) data_wrapper_->pubVehicleLayer(layer_cloud_);
 }
 
 void SuperLIOReLoc::UpdateMap() {

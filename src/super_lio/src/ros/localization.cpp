@@ -230,6 +230,8 @@ void ROSWrapper::setupVehicleCloud() {
       update.stop_topic, command_qos, on_command(update.stop_topic.c_str(), [this]() {
         vehicle_collecting_ = false;
       }));
+  vehicle_layer_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
+      "hikari_loc/vehicle_layer", rclcpp::QoS(1).reliable().transient_local());
   vehicle_clear_sub_ = create_subscription<std_msgs::msg::Bool>(
       update.clear_topic, command_qos, on_command(update.clear_topic.c_str(), [this]() {
         vehicle_collecting_ = false;
@@ -275,6 +277,18 @@ void ROSWrapper::tryAcceptVehicle() {
   vehicle_pending_yaw_ = vehicle_box_yaw_;
   vehicle_pending_set_ = true;
   vehicle_map_stamp_ = stamp;
+}
+
+void ROSWrapper::pubVehicleLayer(const VV3& points) {
+  if (!vehicle_layer_pub_) return;
+  pcl::PointCloud<pcl::PointXYZ> cloud;
+  cloud.reserve(points.size());
+  for (const auto& p : points) cloud.emplace_back(p.x(), p.y(), p.z());
+  sensor_msgs::msg::PointCloud2 msg;
+  pcl::toROSMsg(cloud, msg);
+  msg.header.frame_id = map_frame_;
+  msg.header.stamp = now();
+  vehicle_layer_pub_->publish(msg);
 }
 
 bool ROSWrapper::takeVehicleUpdate(VV3& points, scalar& yaw) {

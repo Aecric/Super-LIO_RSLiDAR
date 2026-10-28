@@ -99,6 +99,8 @@ public:
   /// start and stop commands; take...Clear() is true once per clear command.
   bool vehicleCollecting() const { return vehicle_collecting_; }
   bool takeVehicleLayerClear() { return std::exchange(vehicle_layer_clear_, false); }
+  /// Debug: the points the map update added (map frame, latched).
+  void pubVehicleLayer(const BASIC::VV3& points);
   /// Relocalization blocks the executor for seconds; restart the input
   /// watchdog afterwards so the stall is not mistaken for a sensor dropout.
   void resetInputWatchdog() {
@@ -180,6 +182,7 @@ private:
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr vehicle_start_sub_, vehicle_stop_sub_, vehicle_clear_sub_;
   bool vehicle_collecting_ = false;
   bool vehicle_layer_clear_ = false;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr vehicle_layer_pub_;
   void setupParams();
   void setupIO();
   void createSensorSubscriptions();

@@ -196,8 +196,9 @@ public:
 
   void insert(const Points& cloud_world);
   /// Adds points to empty sub-voxels only, never evicting: the existing map stays
-  /// exactly as it is. Returns the number of sub-voxels filled.
-  std::size_t insertNew(const Points& cloud_world);
+  /// exactly as it is. Appends the points stored to *added when given; returns
+  /// the number of sub-voxels filled.
+  std::size_t insertNew(const Points& cloud_world, Points* added = nullptr);
   void printInfo() const;
   void getMap(std::vector<float>&) const;
   void saveMap() const;    // TODO:
@@ -273,7 +274,7 @@ private:
 
 
 template<typename Point, typename Scalar>
-std::size_t OctVoxMap<Point, Scalar>::insertNew(const Points& cloud_world){
+std::size_t OctVoxMap<Point, Scalar>::insertNew(const Points& cloud_world, Points* added_points){
   std::size_t added = 0;
   for(const auto& pt : cloud_world){
     KEY fine_key = (pt * sub_inv_resolution_).array().floor().template cast<int>();
@@ -285,14 +286,17 @@ std::size_t OctVoxMap<Point, Scalar>::insertNew(const Points& cloud_world){
 
     auto iter = grids_.find(key);
     if (iter != grids_.end()) {
-      if (iter->second->second.AddIfEmpty(pt, local_idx)) ++added;
+      if (!iter->second->second.AddIfEmpty(pt, local_idx)) continue;
     } else if (data_.size() + 1 < capacity_) {
       data_.emplace_front(std::piecewise_construct,
         std::forward_as_tuple(key),
         std::forward_as_tuple(pt, local_idx));
       grids_.insert(std::make_pair(key, data_.begin()));
-      ++added;
+    } else {
+      continue;
     }
+    ++added;
+    if (added_points) added_points->push_back(pt);
   }
   return added;
 }

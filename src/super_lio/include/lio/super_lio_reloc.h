@@ -112,7 +112,7 @@ private:
   BASIC::VV3 vehicle_points_;
   BASIC::scalar vehicle_cos_ = 1, vehicle_sin_ = 0;
   BASIC::V3 region_lo_ = BASIC::V3::Zero(), region_hi_ = BASIC::V3::Zero();
-  std::size_t layer_points_ = 0;   // sub-voxels filled by the map update
+  BASIC::VV3 layer_cloud_;   // points the map update stored, one per sub-voxel filled
   bool layer_collecting_ = false;
 };
 
