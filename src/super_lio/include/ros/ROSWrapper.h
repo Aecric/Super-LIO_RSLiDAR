@@ -90,6 +90,9 @@ public:
   /// Commanded velocity (still.cmd_vel_topic): idle = zero for cmd_hold_sec.
   enum class CmdState { kIdle, kMoving, kUnknown };
   CmdState cmdState() const;
+  /// Vehicle cloud change for the fixed map (vehicle.*): true once per newly
+  /// accepted cloud (points filled) and once when it expires (points empty).
+  bool takeVehicleUpdate(BASIC::VV3& points);
   /// Relocalization blocks the executor for seconds; restart the input
   /// watchdog afterwards so the stall is not mistaken for a sensor dropout.
   void resetInputWatchdog() {
@@ -157,6 +160,16 @@ private:
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_sub_;
   rclcpp::Subscription<geometry_msgs::msg::TwistStamped>::SharedPtr cmd_vel_stamped_sub_;
   double last_cmd_motion_ = 0;  // node time of the last non-zero command
+  void setupVehicleCloud();
+  void tryAcceptVehicle();
+  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr vehicle_cloud_sub_;
+  rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr vehicle_box_sub_;
+  sensor_msgs::msg::PointCloud2::ConstSharedPtr vehicle_cloud_msg_;
+  double vehicle_box_stamp_ = -1;       // stamp of the latest box (successful run)
+  double vehicle_checked_stamp_ = -1;   // latest cloud stamp already accepted or rejected
+  double vehicle_map_stamp_ = -1;       // stamp of the cloud in the map; -1 = none
+  BASIC::VV3 vehicle_pending_;
+  bool vehicle_pending_set_ = false;
   void setupParams();
   void setupIO();
   void createSensorSubscriptions();

@@ -112,6 +112,16 @@
     # Zero-velocity update while tracking: needs an idle command (never IMU only).
     zupt.enable: true
     zupt.velocity_sigma: 0.02                 # m/s
+    # Vehicle cloud from target modeling, added to the fixed map. The vehicle is
+    # not in the map; docking beside it, its unmatched long side pulled the pose
+    # sideways and let it slide along the vehicle. A cloud is used only with a
+    # box of the same stamp (failed runs publish the cloud without one); a newer
+    # run replaces it, and it is removed timeout_sec after modeling.
+    vehicle.enable: true
+    vehicle.cloud_topic: "/tm/debug_registered_cloud"   # map frame
+    vehicle.box_topic: "/tm/box_pose"
+    vehicle.timeout_sec: 1800.0
+    vehicle.min_points: 200
     reloc.origin_prior.enable: true
     reloc.origin_prior.x: 0.0                 # IMU position where the device usually starts
     reloc.origin_prior.y: 0.0

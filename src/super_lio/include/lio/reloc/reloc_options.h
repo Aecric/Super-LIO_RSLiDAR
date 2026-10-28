@@ -63,6 +63,22 @@ struct RelocOptions {
     double velocity_sigma = 0.02;  // m/s, std of the zero-velocity observation
   } zupt;
 
+  /// Vehicle cloud from target modeling (params vehicle.*), added to the fixed
+  /// map while fresh. The vehicle parks beside the docking points but is not in
+  /// the map, and its long side runs along the driving direction: unmatched, its
+  /// points pull the pose sideways while the map has nothing to hold it along
+  /// the vehicle. In the map, its side and ends constrain both directions.
+  struct Vehicle {
+    bool enable = true;
+    std::string cloud_topic = "/tm/debug_registered_cloud";  // map frame, latched
+    // Published only for a successful run; the cloud topic also carries the raw
+    // accumulation of a failed one, so a cloud is used only with a box of the
+    // same stamp.
+    std::string box_topic = "/tm/box_pose";
+    double timeout_sec = 1800.0;   // removed this long after the modeling stamp
+    int min_points = 200;
+  } vehicle;
+
   /// Devices usually power up near where the map was started (map origin), so
   /// the cold start first tries that position with a set of yaw hypotheses.
   struct OriginPrior {

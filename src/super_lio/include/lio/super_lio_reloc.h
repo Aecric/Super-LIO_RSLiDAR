@@ -65,6 +65,9 @@ private:
   void onMeasure() override;
   /// One scan of the post-acceptance window (reloc.verify); false discards the pose.
   bool verifyScan(const NavState& state, std::size_t matched);
+  /// Localization: rebuild the search index from the fixed map plus extra
+  /// points in the map frame (the modeled vehicle; empty = fixed map only).
+  void rebuildFixedIndex(const BASIC::VV3& extra);
 
 private:
   bool map_loaded_ = false;

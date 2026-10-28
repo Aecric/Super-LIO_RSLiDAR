@@ -62,6 +62,11 @@ void ROSWrapper::setupLocalization() {
   r.verify.max_speed = declare_parameter<double>("reloc.verify.max_speed", r.verify.max_speed);
   r.zupt.enable = declare_parameter<bool>("zupt.enable", r.zupt.enable);
   r.zupt.velocity_sigma = declare_parameter<double>("zupt.velocity_sigma", r.zupt.velocity_sigma);
+  r.vehicle.enable = declare_parameter<bool>("vehicle.enable", r.vehicle.enable);
+  r.vehicle.cloud_topic = declare_parameter<std::string>("vehicle.cloud_topic", r.vehicle.cloud_topic);
+  r.vehicle.box_topic = declare_parameter<std::string>("vehicle.box_topic", r.vehicle.box_topic);
+  r.vehicle.timeout_sec = declare_parameter<double>("vehicle.timeout_sec", r.vehicle.timeout_sec);
+  r.vehicle.min_points = declare_parameter<int>("vehicle.min_points", r.vehicle.min_points);
   r.origin_prior.enable = declare_parameter<bool>("reloc.origin_prior.enable", r.origin_prior.enable);
   r.origin_prior.x = declare_parameter<double>("reloc.origin_prior.x", r.origin_prior.x);
   r.origin_prior.y = declare_parameter<double>("reloc.origin_prior.y", r.origin_prior.y);
@@ -107,6 +112,8 @@ void ROSWrapper::setupLocalization() {
   if (r.cold_start.max_attempts < 0 || !kiss_voxels_ok ||
       r.still.cmd_hold_sec < 0 || r.still.max_gyro_mean <= 0 || r.still.max_gyro_std <= 0 ||
       r.still.max_acc_std <= 0 || r.zupt.velocity_sigma <= 0 || r.verify.frames < 0 ||
+      (r.vehicle.enable && (r.vehicle.cloud_topic.empty() || r.vehicle.box_topic.empty() ||
+                            r.vehicle.timeout_sec <= 0 || r.vehicle.min_points < 1)) ||
       r.verify.min_match_ratio < 0 || r.verify.min_match_ratio > 1 ||
       r.verify.max_still_drift <= 0 || r.verify.max_speed <= 0 ||
       r.origin_prior.yaw_step_deg <= 0 || r.origin_prior.yaw_step_deg > 360 ||
@@ -127,6 +134,7 @@ void ROSWrapper::setupLocalization() {
       "/pcdmap", rclcpp::QoS(1).reliable().transient_local());
   loc_status_timer_ = create_wall_timer(std::chrono::milliseconds(200), [this]() { publishLocStatus(); });
   setupCmdVel();
+  setupVehicleCloud();
 }
 
 void ROSWrapper::setupCmdVel() {
@@ -164,6 +172,75 @@ ROSWrapper::CmdState ROSWrapper::cmdState() const {
   if (publishers == 0) return CmdState::kUnknown;
   return now().seconds() - last_cmd_motion_ >= reloc_options_.still.cmd_hold_sec ? CmdState::kIdle
                                                                                  : CmdState::kMoving;
+}
+
+void ROSWrapper::setupVehicleCloud() {
+  const auto& vehicle = reloc_options_.vehicle;
+  if (!vehicle.enable) return;
+  // Latched on the modeling side: a restarted localization still gets the last run.
+  const auto qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
+  vehicle_cloud_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
+      vehicle.cloud_topic, qos, [this](sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
+        vehicle_cloud_msg_ = msg;
+        tryAcceptVehicle();
+      });
+  vehicle_box_sub_ = create_subscription<geometry_msgs::msg::PoseStamped>(
+      vehicle.box_topic, qos, [this](geometry_msgs::msg::PoseStamped::ConstSharedPtr msg) {
+        vehicle_box_stamp_ = rclcpp::Time(msg->header.stamp).seconds();
+        tryAcceptVehicle();
+      });
+  LOG(INFO) << GREEN << " ---> [Vehicle] cloud from " << vehicle.cloud_topic << " (with " << vehicle.box_topic
+            << "), kept " << vehicle.timeout_sec << " s" << RESET;
+}
+
+void ROSWrapper::tryAcceptVehicle() {
+  // Both are published in one modeling run with the same stamp; a cloud without
+  // its box comes from a failed run and is never used.
+  constexpr double kPairTolerance = 0.5;  // s
+  if (!vehicle_cloud_msg_ || vehicle_box_stamp_ < 0) return;
+  const double stamp = rclcpp::Time(vehicle_cloud_msg_->header.stamp).seconds();
+  if (stamp == vehicle_checked_stamp_ || std::abs(stamp - vehicle_box_stamp_) > kPairTolerance) return;
+  vehicle_checked_stamp_ = stamp;
+  const auto& vehicle = reloc_options_.vehicle;
+  const double age = now().seconds() - stamp;
+  if (vehicle_cloud_msg_->header.frame_id != map_frame_) {
+    LOG(WARNING) << YELLOW << " ---> [Vehicle] cloud ignored: frame " << vehicle_cloud_msg_->header.frame_id
+                 << ", expected " << map_frame_ << RESET;
+    return;
+  }
+  if (age > vehicle.timeout_sec) {
+    LOG(INFO) << YELLOW << " ---> [Vehicle] cloud ignored: modeled " << age << " s ago (timeout "
+              << vehicle.timeout_sec << " s)" << RESET;
+    return;
+  }
+  pcl::PointCloud<pcl::PointXYZ> cloud;
+  pcl::fromROSMsg(*vehicle_cloud_msg_, cloud);
+  VV3 points;
+  points.reserve(cloud.size());
+  for (const auto& p : cloud)
+    if (std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z)) points.emplace_back(p.x, p.y, p.z);
+  if (points.size() < static_cast<std::size_t>(vehicle.min_points)) {
+    LOG(WARNING) << YELLOW << " ---> [Vehicle] cloud ignored: " << points.size() << " points (min "
+                 << vehicle.min_points << ")" << RESET;
+    return;
+  }
+  vehicle_pending_.swap(points);
+  vehicle_pending_set_ = true;
+  vehicle_map_stamp_ = stamp;
+}
+
+bool ROSWrapper::takeVehicleUpdate(VV3& points) {
+  if (vehicle_pending_set_) {
+    points.swap(vehicle_pending_);
+    vehicle_pending_.clear();
+    vehicle_pending_set_ = false;
+    return true;
+  }
+  if (vehicle_map_stamp_ < 0 || now().seconds() - vehicle_map_stamp_ <= reloc_options_.vehicle.timeout_sec)
+    return false;
+  vehicle_map_stamp_ = -1;
+  points.clear();
+  return true;
 }
 
 void ROSWrapper::publishLocalization(const NavState& state) {

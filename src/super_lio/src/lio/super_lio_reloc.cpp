@@ -162,6 +162,14 @@ bool SuperLIOReLoc::coldStartArmed() const {
 }
 
 void SuperLIOReLoc::process() {
+  if (data_wrapper_->localization() && map_loaded_) {
+    VV3 vehicle;
+    if (data_wrapper_->takeVehicleUpdate(vehicle)) {
+      rebuildFixedIndex(vehicle);
+      if (vehicle.empty())
+        LOG(INFO) << YELLOW << " ---> [Vehicle] cloud expired, removed from the map" << RESET;
+    }
+  }
   if (data_wrapper_->localization() && data_wrapper_->is_active()) {
     if (flg_get_init_guess_ && kf_->init_) Reset();
     // Once tracking is lost, require a validated new initial pose.
@@ -293,19 +301,14 @@ bool SuperLIOReLoc::map_init(){
 
   if (point_map_->empty()) return false;
 
-  VV3 point_map_v3;
-  point_map_v3.reserve(point_map_->size());
-  for(const auto& point: *point_map_){
-    V3 pt(point.x, point.y, point.z);
-    point_map_v3.push_back(pt);
-  }
-
   if (data_wrapper_->localization()) {
-    // No LRU eviction while loading a fixed map, even with a small configured capacity.
-    const auto capacity = std::max(static_cast<std::size_t>(g_ivox_capacity), point_map_v3.size() + 1);
-    ivox_.reset(new OctVoxMapType(OctVoxMapType::Options{g_ivox_resolution, capacity}));
+    rebuildFixedIndex({});
+  } else {
+    VV3 point_map_v3;
+    point_map_v3.reserve(point_map_->size());
+    for (const auto& point : *point_map_) point_map_v3.emplace_back(point.x, point.y, point.z);
+    ivox_->insert(point_map_v3);
   }
-  ivox_->insert(point_map_v3);
 
   LOG(INFO) << GREEN << " ---> Load map success. File: " << map_name << RESET;
   LOG(INFO) << GREEN << " ---> Map size: " << point_map_->size() << RESET;
@@ -316,6 +319,29 @@ bool SuperLIOReLoc::map_init(){
   data_wrapper_->set_global_map(point_map_);
   data_wrapper_->set_initial_data(re_init_pose_, flg_get_init_guess_);
   return true;
+}
+
+
+void SuperLIOReLoc::rebuildFixedIndex(const VV3& extra) {
+  const auto start = std::chrono::steady_clock::now();
+  VV3 points;
+  points.reserve(point_map_->size() + extra.size());
+  for (const auto& point : *point_map_) points.emplace_back(point.x, point.y, point.z);
+  points.insert(points.end(), extra.begin(), extra.end());
+  // No LRU eviction in a fixed map, even with a small configured capacity.
+  const auto capacity = std::max(static_cast<std::size_t>(g_ivox_capacity), points.size() + 1);
+  ivox_.reset(new OctVoxMapType(OctVoxMapType::Options{g_ivox_resolution, capacity}));
+  ivox_->insert(points);
+  if (extra.empty()) return;
+  V3 lo = extra.front(), hi = extra.front();
+  for (const auto& p : extra) {
+    lo = lo.cwiseMin(p);
+    hi = hi.cwiseMax(p);
+  }
+  const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start);
+  LOG(INFO) << GREEN << " ---> [Vehicle] " << extra.size() << " points added to the map, x[" << lo.x() << ", "
+            << hi.x() << "] y[" << lo.y() << ", " << hi.y() << "] z[" << lo.z() << ", " << hi.z() << "] ("
+            << ms.count() << " ms)" << RESET;
 }
 
 
