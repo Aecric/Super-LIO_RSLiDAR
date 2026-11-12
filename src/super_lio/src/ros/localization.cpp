@@ -46,6 +46,7 @@ void ROSWrapper::setupLocalization() {
   publish_path_ = declare_parameter<bool>("runtime.publish_path", true);
   imu_timeout_ = declare_parameter<double>("runtime.imu_timeout_sec", 1.0);
   lidar_timeout_ = declare_parameter<double>("runtime.lidar_timeout_sec", 2.0);
+  still_dropout_max_ = declare_parameter<double>("runtime.still_dropout_max_sec", still_dropout_max_);
   auto& r = reloc_options_;
   r.cold_start.enable = declare_parameter<bool>("reloc.cold_start.enable", r.cold_start.enable);
   r.cold_start.max_attempts = declare_parameter<int>("reloc.cold_start.max_attempts", r.cold_start.max_attempts);
@@ -79,6 +80,9 @@ void ROSWrapper::setupLocalization() {
   u.clear_topic = declare_parameter<std::string>("vehicle.update.clear_topic", u.clear_topic);
   u.margin = declare_parameter<double>("vehicle.update.margin", u.margin);
   u.min_range = declare_parameter<double>("vehicle.update.min_range", u.min_range);
+  r.last_pose.enable = declare_parameter<bool>("reloc.last_pose.enable", r.last_pose.enable);
+  r.last_pose.max_delta_trans = declare_parameter<double>("reloc.last_pose.max_delta_trans", r.last_pose.max_delta_trans);
+  r.last_pose.max_delta_rot_deg = declare_parameter<double>("reloc.last_pose.max_delta_rot_deg", r.last_pose.max_delta_rot_deg);
   r.origin_prior.enable = declare_parameter<bool>("reloc.origin_prior.enable", r.origin_prior.enable);
   r.origin_prior.x = declare_parameter<double>("reloc.origin_prior.x", r.origin_prior.x);
   r.origin_prior.y = declare_parameter<double>("reloc.origin_prior.y", r.origin_prior.y);
@@ -131,6 +135,7 @@ void ROSWrapper::setupLocalization() {
                                         u.clear_topic.empty() || u.margin < 0 || u.min_range < 0)) ||
       r.verify.min_match_ratio < 0 || r.verify.min_match_ratio > 1 ||
       r.verify.max_still_drift <= 0 || r.verify.max_speed <= 0 ||
+      r.last_pose.max_delta_trans <= 0 || r.last_pose.max_delta_rot_deg <= 0 ||
       r.origin_prior.yaw_step_deg <= 0 || r.origin_prior.yaw_step_deg > 360 ||
       r.origin_prior.max_delta_trans <= 0 || r.kiss.min_agreeing_candidates < 1 || r.genz.map_voxel <= 0 ||
       r.genz.max_points_per_voxel < 1 || r.genz.max_iterations < 1 || r.genz.coarse_max_corr <= 0 ||
@@ -139,7 +144,7 @@ void ROSWrapper::setupLocalization() {
     throw std::runtime_error("Invalid reloc.* parameters");
   if (g_filter_rate < 1 || g_pub_step < 1 || g_ivox_resolution <= 0 ||
       g_voxel_fliter_size <= 0 || g_kf_max_iterations < 1 ||
-      imu_timeout_ <= 0 || lidar_timeout_ <= 0)
+      imu_timeout_ <= 0 || lidar_timeout_ <= 0 || still_dropout_max_ < 0)
     throw std::runtime_error("Invalid localization sensor/filter/watchdog parameters");
   loc_state_pub_ = create_publisher<std_msgs::msg::Int32>("hikari_loc/loc_state", 10);
   ndt_status_pub_ = create_publisher<std_msgs::msg::Int32>("hikari_loc/ndt_status", 10);
@@ -165,8 +170,13 @@ void ROSWrapper::setupCmdVel() {
   auto on_cmd = [this](const geometry_msgs::msg::Twist& twist) {
     constexpr double kZero = 1e-3;
     if (std::abs(twist.linear.x) > kZero || std::abs(twist.linear.y) > kZero ||
-        std::abs(twist.angular.z) > kZero)
+        std::abs(twist.angular.z) > kZero) {
       last_cmd_motion_ = now().seconds();
+      // The robot may move before the next scan: a dropout from here on is not
+      // a standstill, even once this command has expired. Same thread as the
+      // watchdog and the scans (single-threaded executor).
+      standstill_ = false;
+    }
   };
   if (still.cmd_vel_stamped)
     cmd_vel_stamped_sub_ = create_subscription<geometry_msgs::msg::TwistStamped>(
@@ -340,6 +350,7 @@ void ROSWrapper::publishLocalization(const NavState& state) {
   if (last_output_stamp_ >= 0 && state.timestamp > last_output_stamp_)
     fps_ = 1.0 / (state.timestamp - last_output_stamp_);
   last_output_stamp_ = state.timestamp;
+  output_since_degraded_ = true;
   if (!publish_tf_) return;
   auto send = [&](const std::string& parent, const std::string& child, const SE3& pose) {
     geometry_msgs::msg::TransformStamped tf;
@@ -367,12 +378,30 @@ void ROSWrapper::publishLocStatus() {
   const double time = now().seconds();
   const double imu_age = last_imu_received_ < 0 ? -1 : std::max(0.0, time - last_imu_received_);
   const double lidar_age = last_lidar_received_ < 0 ? -1 : std::max(0.0, time - last_lidar_received_);
+  const bool timed_out = imu_age < 0 || lidar_age < 0 || imu_age > imu_timeout_ || lidar_age > lidar_timeout_;
+  // A dropout while standing (ZUPT / pose hold at the last scan, command still
+  // idle) cannot move the pose: keep it, DEGRADED, for up to still_dropout_max_.
+  const bool ride_out = standstill_ && cmdState() == CmdState::kIdle && imu_age >= 0 && lidar_age >= 0 &&
+                        std::max(imu_age, lidar_age) <= still_dropout_max_;
   if (!is_active()) loc_state_ = 5;
-  else if (loc_state_ == 2 && (imu_age < 0 || lidar_age < 0 ||
-           imu_age > imu_timeout_ || lidar_age > lidar_timeout_)) {
+  else if (loc_state_ == 2 && timed_out && ride_out) {
+    loc_state_ = 3;
+    degraded_since_ = time;
+    output_since_degraded_ = false;
+    LOG(WARNING) << YELLOW << " ---> [Loc] DEGRADED: sensor timeout while standing still, pose kept; imu_age="
+                 << imu_age << " s (limit " << imu_timeout_ << "), lidar_age=" << lidar_age << " s (limit "
+                 << lidar_timeout_ << "); LOST if the robot is commanded or no data for " << still_dropout_max_
+                 << " s" << RESET;
+  } else if (loc_state_ == 3 && !timed_out && output_since_degraded_) {
+    loc_state_ = 2;
+    LOG(WARNING) << GREEN << " ---> [Loc] GOOD again: sensor data back and tracking, DEGRADED for "
+                 << time - degraded_since_ << " s" << RESET;
+  } else if ((loc_state_ == 2 || loc_state_ == 3) && timed_out && !ride_out) {
+    const char* reason = loc_state_ == 2 ? "" : cmdState() != CmdState::kIdle ? " after DEGRADED (robot commanded)"
+                                                                               : " after DEGRADED (dropout too long)";
     loc_state_ = 4;
-    LOG(WARNING) << RED << " ---> [Loc] LOST: sensor timeout, imu_age=" << imu_age << " s (limit " << imu_timeout_
-                 << "), lidar_age=" << lidar_age << " s (limit " << lidar_timeout_ << ")" << RESET;
+    LOG(WARNING) << RED << " ---> [Loc] LOST: sensor timeout" << reason << ", imu_age=" << imu_age << " s (limit "
+                 << imu_timeout_ << "), lidar_age=" << lidar_age << " s (limit " << lidar_timeout_ << ")" << RESET;
   }
   std_msgs::msg::Int32 state;
   state.data = loc_state_;
@@ -386,7 +415,7 @@ void ROSWrapper::publishLocStatus() {
   // PCL fitness is not hikari's NDT confidence: explicitly report unavailable.
   status.data = {static_cast<float>(loc_state_), -1.f, static_cast<float>(imu_age),
                 static_cast<float>(lidar_age), loc_state_ == 2 ? static_cast<float>(fps_) : 0.f,
-                loc_state_ == 2 ? 1.f : 0.f};
+                loc_state_ == 2 || loc_state_ == 3 ? 1.f : 0.f};
   loc_status_pub_->publish(status);
   visualization_msgs::msg::Marker marker;
   marker.header.frame_id = map_frame_;
@@ -401,8 +430,8 @@ void ROSWrapper::publishLocStatus() {
   marker.scale.z = 1.5;
   marker.color.a = 1;
   marker.color.r = loc_state_ == 2 ? 0 : 1;
-  marker.color.g = loc_state_ == 2 ? 1 : 0;
-  marker.text = loc_state_ == 2 ? "GOOD" : loc_state_ == 1 ? "INIT" :
+  marker.color.g = loc_state_ == 2 || loc_state_ == 3 ? 1 : 0;
+  marker.text = loc_state_ == 2 ? "GOOD" : loc_state_ == 1 ? "INIT" : loc_state_ == 3 ? "DEGRADED" :
                 loc_state_ == 4 ? "LOST" : "WAIT FOR /initialpose";
   loc_marker_pub_->publish(marker);
 }

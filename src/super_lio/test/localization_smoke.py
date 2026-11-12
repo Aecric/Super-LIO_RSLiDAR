@@ -264,6 +264,257 @@ class LocalizationSmoke(unittest.TestCase):
                     process.wait()
                 log.close()
 
+    def test_dropout_while_standing(self):
+        """Sensor dropout with an idle command: DEGRADED, pose kept; too long: LOST,
+        then relocalized from the last GOOD pose."""
+        from geometry_msgs.msg import Twist
+        executable = str(Path(get_package_prefix('super_lio')) / 'lib/super_lio/run_loclite_online')
+        config = str(Path(get_package_share_directory('super_lio')) / 'config/loclite_livox.yaml')
+        with tempfile.TemporaryDirectory(prefix='super-lio-dropout-test-') as directory:
+            write_map(directory)
+            log = open(Path(directory) / 'node.log', 'w+')
+            process = subprocess.Popen([executable, '--config='+config, '--map_path='+directory,
+                                       '--ros-args', '-p', 'reloc.origin_prior.x:=2.0',
+                                       '-p', 'reloc.origin_prior.y:=-1.0',
+                                       '-p', 'reloc.origin_prior.z:=0.6',
+                                       '-p', 'reloc.origin_prior.yaw_step_deg:=360.0',
+                                       '-p', 'runtime.still_dropout_max_sec:=3.0',
+                                       # Short hold: a command expires well before the IMU timeout.
+                                       '-p', 'still.cmd_hold_sec:=0.3'],
+                                       stdout=log, stderr=log)
+            rclpy.init()
+            node = rclpy.create_node('dropout_smoke')
+            odoms, states = [], []
+            node.create_subscription(Odometry, '/hikari_loc/odom', odoms.append, 10)
+            node.create_subscription(Int32, '/hikari_loc/loc_state', lambda msg: states.append(msg.data), 10)
+            imu_pub = node.create_publisher(Imu, '/livox/imu', 50)
+            lidar_pub = node.create_publisher(CustomMsg, '/livox/lidar', 10)
+            # A command source that stays at zero: the robot is standing (ZUPT / hold).
+            cmd_pub = node.create_publisher(Twist, '/cmd_vel', 10)
+
+            def spin_for(seconds, feed, until=None, turn_for=0.):
+                start = time.monotonic()
+                end = start + seconds
+                counter = 0
+                while time.monotonic() < end and not (until and until()):
+                    self.assertIsNone(process.poll(), 'localization node exited')
+                    if time.monotonic() - start < turn_for:
+                        twist = Twist()
+                        twist.angular.z = .1
+                        cmd_pub.publish(twist)
+                    elif counter % 10 == 0:
+                        cmd_pub.publish(Twist())
+                    if feed:
+                        stamp = node.get_clock().now().to_msg()
+                        imu = Imu()
+                        imu.header.stamp = stamp
+                        imu.linear_acceleration.z = 9.7946
+                        imu_pub.publish(imu)
+                        if counter % 5 == 0:
+                            scan = CustomMsg()
+                            scan.header.stamp = stamp
+                            scan.point_num = len(POINTS)
+                            scan.points = [CustomPoint(x=float(x), y=float(y), z=float(z),
+                                reflectivity=10, tag=0, line=0,
+                                offset_time=int(i * 50_000_000 / len(POINTS)))
+                                for i, (x, y, z) in enumerate(POINTS)]
+                            lidar_pub.publish(scan)
+                    counter += 1
+                    rclpy.spin_once(node, timeout_sec=.01)
+                    time.sleep(.01)
+
+            def node_log():
+                log.flush()
+                log.seek(0)
+                return log.read()
+
+            def check_pose():
+                pose = odoms[-1].pose.pose
+                self.assertAlmostEqual(pose.position.x, 2., delta=.15)
+                self.assertAlmostEqual(pose.position.y, -1., delta=.15)
+                self.assertAlmostEqual(2 * math.atan2(pose.orientation.z, pose.orientation.w), YAW, delta=.05)
+
+            try:
+                spin_for(20, True, until=lambda: 2 in states)
+                self.assertIn(2, states, 'cold start should reach GOOD')
+                spin_for(2, True)   # ZUPT / hold engage
+                self.assertIn('[ZUPT] on', node_log())
+
+                # Short dropout: DEGRADED, never LOST, GOOD again once data is back.
+                mark = len(states)
+                spin_for(2, False)
+                self.assertIn(3, states[mark:], 'dropout while standing must be DEGRADED')
+                self.assertNotIn(4, states[mark:])
+                self.assertNotIn(5, states[mark:])
+                count = len(odoms)
+                spin_for(2, True)
+                self.assertEqual(states[-1], 2, 'must return to GOOD when data is back')
+                self.assertNotIn(4, states[mark:])
+                self.assertGreater(len(odoms), count)
+                check_pose()
+                text = node_log()
+                self.assertIn('DEGRADED: sensor timeout while standing still', text)
+                self.assertIn('GOOD again', text)
+                self.assertNotIn('[Loc] LOST', text)
+
+                # A motion command during the dropout, expired before the timeout
+                # fires: the robot may have moved, so LOST, not DEGRADED.
+                mark = len(states)
+                spin_for(2, False, turn_for=.1)
+                self.assertIn(4, states[mark:] + [5], 'motion during a dropout must be LOST')
+                self.assertNotIn(3, states[mark:], 'motion during a dropout must not be DEGRADED')
+                self.assertIn('[Loc] LOST: sensor timeout, imu_age', node_log())
+                count = len(odoms)
+                spin_for(20, True, until=lambda: len(odoms) > count and states[-1] == 2)
+                self.assertGreater(len(odoms), count, 'must relocalize after LOST')
+                self.assertIn('last pose candidate 1/1 PASS', node_log())
+                check_pose()
+                spin_for(2, True)   # ZUPT / hold engage again
+
+                # Longer than runtime.still_dropout_max_sec: LOST, then the last
+                # GOOD pose is the first cold start candidate.
+                mark = len(states)
+                spin_for(4.5, False)
+                self.assertIn(3, states[mark:])
+                self.assertTrue(4 in states[mark:] or 5 in states[mark:], 'long dropout must leave DEGRADED')
+                self.assertIn('LOST: sensor timeout after DEGRADED (dropout too long)', node_log())
+                count = len(odoms)
+                spin_for(20, True, until=lambda: len(odoms) > count)
+                self.assertGreater(len(odoms), count, 'must relocalize after LOST')
+                self.assertIn('last pose candidate 1/1 PASS', node_log())
+                check_pose()
+            except Exception:
+                print(node_log()[-12000:])
+                raise
+            finally:
+                node.destroy_node()
+                rclpy.shutdown()
+                process.send_signal(signal.SIGINT)
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+                log.close()
+
+    def test_last_pose_only_recovery(self):
+        """No origin prior and no KISS: after /initialpose and LOST, the last GOOD
+        pose alone arms the cold start and relocalizes."""
+        self._last_pose_only_session()
+
+    def test_failed_manual_init_preserves_last_pose(self):
+        """A failed manual verification after last-pose recovery keeps the cache."""
+        self._last_pose_only_session(reject_manual=True)
+
+    def _last_pose_only_session(self, reject_manual=False):
+        executable = str(Path(get_package_prefix('super_lio')) / 'lib/super_lio/run_loclite_online')
+        config = str(Path(get_package_share_directory('super_lio')) / 'config/loclite_livox.yaml')
+        with tempfile.TemporaryDirectory(prefix='super-lio-lastpose-test-') as directory:
+            write_map(directory)
+            log = open(Path(directory) / 'node.log', 'w+')
+            process = subprocess.Popen([executable, '--config='+config, '--map_path='+directory,
+                                       '--ros-args', '-p', 'reloc.origin_prior.enable:=false',
+                                       # Map larger than the KISS limit: KISS disabled.
+                                       '-p', 'reloc.kiss.max_target_points:=10',
+                                       '-p', 'runtime.still_dropout_max_sec:=0.0'],
+                                       stdout=log, stderr=log)
+            rclpy.init()
+            node = rclpy.create_node('last_pose_smoke')
+            odoms, states = [], []
+            node.create_subscription(Odometry, '/hikari_loc/odom', odoms.append, 10)
+            node.create_subscription(Int32, '/hikari_loc/loc_state', lambda msg: states.append(msg.data), 10)
+            imu_pub = node.create_publisher(Imu, '/livox/imu', 50)
+            lidar_pub = node.create_publisher(CustomMsg, '/livox/lidar', 10)
+            initial_pub = node.create_publisher(PoseWithCovarianceStamped, '/initialpose', 1)
+
+            def spin_for(seconds, feed, until=None, points=POINTS):
+                end = time.monotonic() + seconds
+                counter = 0
+                while time.monotonic() < end and not (until and until()):
+                    self.assertIsNone(process.poll(), 'localization node exited')
+                    if feed:
+                        stamp = node.get_clock().now().to_msg()
+                        imu = Imu()
+                        imu.header.stamp = stamp
+                        imu.linear_acceleration.z = 9.7946
+                        imu_pub.publish(imu)
+                        if counter % 5 == 0:
+                            scan = CustomMsg()
+                            scan.header.stamp = stamp
+                            scan.point_num = len(points)
+                            scan.points = [CustomPoint(x=float(x), y=float(y), z=float(z),
+                                reflectivity=10, tag=0, line=0,
+                                offset_time=int(i * 50_000_000 / len(points)))
+                                for i, (x, y, z) in enumerate(points)]
+                            lidar_pub.publish(scan)
+                    counter += 1
+                    rclpy.spin_once(node, timeout_sec=.01)
+                    time.sleep(.01)
+
+            def node_log():
+                log.flush()
+                log.seek(0)
+                return log.read()
+
+            try:
+                spin_for(1.5, True)
+                self.assertFalse(odoms, 'no guess source: must wait for /initialpose')
+                self.assertNotIn('cold start: keep still', node_log())
+                pose = PoseWithCovarianceStamped()
+                pose.header.frame_id = 'map'
+                pose.pose.pose.position.x, pose.pose.pose.position.y, pose.pose.pose.position.z = 2., -1., .6
+                pose.pose.pose.orientation.z = math.sin(YAW/2)
+                pose.pose.pose.orientation.w = math.cos(YAW/2)
+                initial_pub.publish(pose)
+                spin_for(10, True, until=lambda: 2 in states)
+                self.assertIn(2, states, '/initialpose should reach GOOD')
+                mark = len(states)
+                spin_for(2, False)
+                self.assertTrue(4 in states[mark:] or 5 in states[mark:], 'dropout must be LOST')
+                count = len(odoms)
+                spin_for(20, True, until=lambda: len(odoms) > count)
+                self.assertGreater(len(odoms), count, 'last pose alone must relocalize')
+                self.assertIn('last pose candidate 1/1 PASS', node_log())
+                last = odoms[-1].pose.pose
+                self.assertAlmostEqual(last.position.x, 2., delta=.15)
+                self.assertAlmostEqual(last.position.y, -1., delta=.15)
+                if reject_manual:
+                    # The last recovery left the initialization source as "last
+                    # pose". Accept a new manual registration, then feed scans
+                    # far outside the map during its verification window.
+                    mark = len(node_log())
+                    initial_pub.publish(pose)
+                    spin_for(10, True, until=lambda: '[Verify] tracking' in node_log()[mark:])
+                    self.assertIn('initialpose candidate 1/1 PASS', node_log()[mark:])
+                    self.assertIn('[Verify] tracking', node_log()[mark:])
+                    count = len(odoms)
+                    bad_points = [(x+30., y+30., z) for x, y, z in POINTS]
+                    spin_for(2, True, until=lambda: '[Loc] LOST:' in node_log()[mark:],
+                             points=bad_points)
+                    self.assertIn('[Loc] LOST:', node_log()[mark:], 'manual verification must fail')
+                    self.assertEqual(len(odoms), count, 'unverified manual pose must not be published')
+                    self.assertNotIn('last pose rejected while verifying', node_log()[mark:],
+                                     'manual verification must preserve the cached GOOD pose')
+                    spin_for(20, True, until=lambda: len(odoms) > count)
+                    self.assertGreater(len(odoms), count, 'cached pose must still arm automatic recovery')
+                    self.assertIn('last pose candidate 1/1 PASS', node_log()[mark:])
+                    last = odoms[-1].pose.pose
+                    self.assertAlmostEqual(last.position.x, 2., delta=.15)
+                    self.assertAlmostEqual(last.position.y, -1., delta=.15)
+            except Exception:
+                print(node_log()[-12000:])
+                raise
+            finally:
+                node.destroy_node()
+                rclpy.shutdown()
+                process.send_signal(signal.SIGINT)
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+                log.close()
+
 
 if __name__ == '__main__':
     unittest.main()

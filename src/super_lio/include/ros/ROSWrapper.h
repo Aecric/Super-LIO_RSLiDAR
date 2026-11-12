@@ -88,6 +88,10 @@ public:
   bool localization() const { return localization_; }
   void setLocState(int state) { loc_state_ = state; }
   int locState() const { return loc_state_; }
+  /// Tracking reports whether the robot stood still (ZUPT / pose hold) at the
+  /// last scan; a sensor dropout that starts then is DEGRADED, not LOST. Any
+  /// motion command clears it until the next scan.
+  void setStandstill(bool standstill) { standstill_ = standstill; }
   const RelocOptions& relocOptions() const { return reloc_options_; }
   /// Commanded velocity (still.cmd_vel_topic): idle = zero for cmd_hold_sec.
   enum class CmdState { kIdle, kMoving, kUnknown };
@@ -159,6 +163,11 @@ private:
   double last_imu_received_ = -1, last_lidar_received_ = -1;
   double last_output_stamp_ = -1, last_path_stamp_ = -1, fps_ = 0;
   double imu_timeout_ = 1, lidar_timeout_ = 2;
+  // DEGRADED: sensor dropout while standing still (runtime.still_dropout_max_sec).
+  double still_dropout_max_ = 5;
+  bool standstill_ = false;
+  double degraded_since_ = -1;
+  bool output_since_degraded_ = false;
   rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr loc_state_pub_, ndt_status_pub_;
   rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr loc_status_pub_;
   rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr loc_marker_pub_;

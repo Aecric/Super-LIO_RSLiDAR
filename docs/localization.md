@@ -64,7 +64,39 @@ ros2 topic pub --once /initialpose geometry_msgs/msg/PoseWithCovarianceStamped \
 | `/hikari_loc/loc_status` | `visualization_msgs/msg/Marker` | 定位状态文字 |
 | `/hikari_loc/status` | `std_msgs/msg/Float32MultiArray` | `[state, ndt_conf, imu_age_s, lidar_age_s, fps, in_map]` |
 
-状态编号：0 未初始化、1 初始化中、2 GOOD、3 DEGRADED、4 LOST、5 WAIT_FOR_INITIALPOSE。本实现使用 1/2/4/5；GOOD 表示已通过初始化配准且跟踪有足够匹配，不代表 hikari_loclite 的完整稳定性/退化判定。`ndt_conf=-1` 表示不可用，不能把 PCL 的 ICP fitness 当成 hikari_loclite 的 NDT 置信度。未收到输入时 age 为 -1。状态以 5 Hz 发布；默认 IMU / 雷达掉线阈值为 1 / 2 秒。
+### 定位状态
+
+`loc_state` 与 `status[0]` 使用 hikari_loclite 的同一组编号，本实现用到其中 1/2/3/4/5：
+
+| 值 | 名称 | 本实现中的含义 | 输出 |
+|---|---|---|---|
+| 0 | 未初始化 | 未使用 | — |
+| 1 | INIT | 收到 `/initialpose` 或冷启动开始累积点云，正在配准；配准通过后在验证窗口（`reloc.verify.frames` 帧）内仍保持 1 | 不发布 odom / path / TF |
+| 2 | GOOD | 初始化配准与验证窗口均已通过，且当前帧有效匹配 ≥ 10 点、状态有限、IMU 和雷达未超时 | 发布 odom / path / TF，`fps`、`in_map=1` 有效 |
+| 3 | DEGRADED | 处于 GOOD 且静止（ZUPT 或姿态保持生效、指令为零）时 IMU / 雷达超时：位姿保持不变，不复位滤波器 | 无新数据故不发布新位姿，`in_map=1` |
+| 4 | LOST | 跟踪中有效匹配 < 10 点或状态非有限；或处于 GOOD 且非静止时 IMU / 雷达超时（默认 1 / 2 秒）；或 DEGRADED 期间收到运动指令、断流超过 `runtime.still_dropout_max_sec`（默认 5 秒） | 停止发布新位姿 |
+| 5 | WAIT_FOR_INITIALPOSE | 节点启动初值、重置后、冷启动达到 `reloc.cold_start.max_attempts` 仍失败、或节点被 `set_active` 停用 | 不发布位姿 |
+
+状态转移：
+
+| 从 | 到 | 条件 |
+|---|---|---|
+| 5 | 1 | 收到 `/initialpose`，或冷启动可用（`reloc.cold_start.enable` 且有 KISS 或原点先验、次数未用尽）并开始累积 |
+| 1 | 1 | 配准失败：清空累积重试（手动初值等待重发或冷启动继续） |
+| 1 | 5 | 冷启动配准失败且次数已用尽 |
+| 1 | 2 | 配准通过且验证窗口逐帧通过（`reloc.verify.frames=0` 时配准通过即为 2） |
+| 1 | 5 | 验证窗口内某帧未通过：下一处理周期重置 |
+| 1（验证窗口）/ 2 | 4 | 有效匹配 < 10 点或状态非有限；仅 2 时另有非静止状态下的 IMU / 雷达超时 |
+| 2 | 3 | 静止时 IMU / 雷达超时（打印 WARNING） |
+| 3 | 2 | 数据恢复且已输出一帧有效跟踪结果 |
+| 3 | 4 | 收到运动指令，或断流超过 `runtime.still_dropout_max_sec`；恢复后的首帧匹配 < 10 点同样进入 4 |
+| 4 | 5 | 下一处理周期重置滤波器；若冷启动仍可用随即进入 1 自动重定位（先试本次运行最后一次 GOOD 位姿 `reloc.last_pose.*`，不通过再试原点先验与 KISS），否则等待 `/initialpose` |
+| 任意 | 1 | 收到新的 `/initialpose`：重置后重新配准 |
+| 任意 | 5 | `set_active` 停用 |
+- 姿态保持（`hold`）在状态 2 / 3 下运行，车旁地图更新只在状态 2 下运行，避免把未验证或已丢失的位姿写入结果。
+- GOOD 仅表示通过初始化配准且跟踪有足够匹配，不代表 hikari_loclite 的完整稳定性/退化判定。
+
+`ndt_conf=-1` 表示不可用，不能把 PCL 的 ICP fitness 当成 hikari_loclite 的 NDT 置信度。未收到输入时 age 为 -1。状态以 5 Hz 发布；默认 IMU / 雷达掉线阈值为 1 / 2 秒。
 
 纯定位不发布旧 `/lio/*` 输出；SC 专用调试 topic、手动全局重定位服务及 `run_loclite_offline` 不在此模式中。可使用普通 rosbag 回放验证（从设备静止的时刻开始回放即可触发冷启动）：
 

@@ -153,13 +153,17 @@ void SuperLIOReLoc::Reset() {
   hold_set_ = false;
   verify_left_ = 0;
   verify_failed_ = false;
+  init_from_last_pose_ = false;  // the cached pose itself survives
+  data_wrapper_->setStandstill(false);
   if (data_wrapper_->localization()) data_wrapper_->setLocState(5);
 }
 
 bool SuperLIOReLoc::coldStartArmed() const {
   const auto& options = data_wrapper_->relocOptions();
   const int max_attempts = options.cold_start.max_attempts;
-  return options.cold_start.enable && (kiss_ || options.origin_prior.enable) &&
+  // Any guess source arms it: KISS, the origin prior, or this run's last GOOD pose.
+  const bool last_pose = options.last_pose.enable && has_last_good_pose_;
+  return options.cold_start.enable && (kiss_ || options.origin_prior.enable || last_pose) &&
          (max_attempts == 0 || cold_start_attempts_ < max_attempts);
 }
 
@@ -240,6 +244,7 @@ void SuperLIOReLoc::onMeasure() {
   if (!data_wrapper_->localization() || !kf_->init_) {
     zupt_active_ = false;
     hold_set_ = false;
+    data_wrapper_->setStandstill(false);
     return;
   }
   int count = 0;
@@ -267,13 +272,19 @@ void SuperLIOReLoc::onMeasure() {
               << " rad/s, acc_std=" << stats.acc_std << " m/s^2, |v|=" << v.norm() << " m/s" << RESET;
   }
   holdPose(cmd == ROSWrapper::CmdState::kIdle);
+  // Standing as of this scan: lets the input watchdog ride out a short sensor
+  // dropout (DEGRADED) instead of dropping the pose. The hold anchor covers the
+  // scans the IMU vetoes for ZUPT (arm working) while the robot stays parked.
+  data_wrapper_->setStandstill(zupt_active_ || hold_set_);
 }
 
 void SuperLIOReLoc::holdPose(bool cmd_idle) {
   const auto& hold = data_wrapper_->relocOptions().hold;
   // Only on a verified, tracked pose: holding an unverified one would mask a
-  // wrong acceptance.
-  if (!hold.enable || !cmd_idle || data_wrapper_->locState() != 2) {
+  // wrong acceptance. DEGRADED (sensor dropout while standing) keeps the anchor:
+  // it is what pins the pose when the data comes back.
+  const int loc_state = data_wrapper_->locState();
+  if (!hold.enable || !cmd_idle || (loc_state != 2 && loc_state != 3)) {
     if (hold_set_) {
       LOG(INFO) << YELLOW << " ---> [Hold] released after " << hold_scans_ << " scans; max offset from the anchor "
                 << hold_max_offset_ << " m, " << hold_max_rot_deg_ << " deg" << RESET;
@@ -614,6 +625,9 @@ bool SuperLIOReLoc::alignToMap(bool manual, const M3& level_rot, M4& T_map_imu) 
 
   Eigen::Matrix4d T;
   Selection selection = Selection::kNone;
+  // Set only when the last-pose candidate is the one accepted below; a manual
+  // or origin / KISS pose that fails verification must not drop the cached one.
+  init_from_last_pose_ = false;
   if (manual) {
     // /initialpose denotes map<-lidar, while the query is in IMU.
     selection = selectCandidate(
@@ -624,8 +638,21 @@ bool SuperLIOReLoc::alignToMap(bool manual, const M3& level_rot, M4& T_map_imu) 
     Eigen::Matrix4d T_level_imu = Eigen::Matrix4d::Identity();
     T_level_imu.block<3, 3>(0, 0) = level_rot.cast<double>();
 
+    if (options.last_pose.enable && has_last_good_pose_) {
+      // Position and yaw from the last GOOD pose, roll/pitch from this window's gravity.
+      const Eigen::Matrix3d R_map_level =
+          last_good_pose_.R_.cast<double>() * T_level_imu.block<3, 3>(0, 0).transpose();
+      Eigen::Matrix4d T_map_level = Eigen::Matrix4d::Identity();
+      T_map_level.block<3, 3>(0, 0) = Eigen::AngleAxisd(std::atan2(R_map_level(1, 0), R_map_level(0, 0)),
+                                                        Eigen::Vector3d::UnitZ()).toRotationMatrix();
+      T_map_level.block<3, 1>(0, 3) = last_good_pose_.t_.cast<double>();
+      selection = selectCandidate(query, {T_map_level * T_level_imu}, options.last_pose.max_delta_trans,
+                                  options.last_pose.max_delta_rot_deg, 1, "last pose", T);
+      init_from_last_pose_ = selection == Selection::kAccepted;
+    }
+
     const auto& origin = options.origin_prior;
-    if (origin.enable) {
+    if (selection == Selection::kNone && origin.enable) {
       std::vector<Eigen::Matrix4d> guesses;
       for (double yaw = 0; yaw < 360.0 - 1e-6; yaw += origin.yaw_step_deg) {
         Eigen::Matrix4d T_map_level = Eigen::Matrix4d::Identity();
@@ -712,6 +739,15 @@ SuperLIOReLoc::Selection SuperLIOReLoc::selectCandidate(
   }
   T_map_imu = best->T;
   return Selection::kAccepted;
+}
+
+
+void SuperLIOReLoc::dropLastPoseGuess() {
+  // Do not offer the same guess again: the next cold start goes to origin prior / KISS.
+  if (!init_from_last_pose_ || !has_last_good_pose_) return;
+  has_last_good_pose_ = false;
+  init_from_last_pose_ = false;
+  LOG(WARNING) << YELLOW << " ---> [Reloc] last pose rejected while verifying; not tried again" << RESET;
 }
 
 
@@ -814,6 +850,8 @@ void SuperLIOReLoc::Output() {
                      << state.p.transpose() << "]" << RESET;
       }
       data_wrapper_->setLocState(4);
+      // Lost inside the verification window: the guess was wrong just the same.
+      if (verify_left_ > 0) dropLastPoseGuess();
       return;
     }
     if (verify_left_ > 0) {
@@ -821,6 +859,7 @@ void SuperLIOReLoc::Output() {
       if (!verifyScan(state, matched)) {
         verify_left_ = 0;
         verify_failed_ = true;
+        dropLastPoseGuess();
         return;
       }
       if (--verify_left_ > 0) return;
@@ -828,7 +867,10 @@ void SuperLIOReLoc::Output() {
                 << verify_max_drift_ << " m" << (verify_all_still_ ? " (still)" : " (moving)")
                 << ", max |v| " << verify_max_speed_ << " m/s" << RESET;
     }
-    data_wrapper_->setLocState(2);
+    // DEGRADED is left by the input watchdog once this output is out.
+    if (data_wrapper_->locState() != 3) data_wrapper_->setLocState(2);
+    last_good_pose_ = SE3(state.R, state.p);
+    has_last_good_pose_ = true;
   }
   data_wrapper_->pub_odom(state);
 
