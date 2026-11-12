@@ -89,7 +89,8 @@ public:
   void setLocState(int state) { loc_state_ = state; }
   int locState() const { return loc_state_; }
   /// Tracking reports whether the robot stood still (ZUPT / pose hold) at the
-  /// last scan; a sensor dropout that starts then is DEGRADED, not LOST.
+  /// last scan; a sensor dropout that starts then is DEGRADED, not LOST. Any
+  /// motion command clears it until the next scan.
   void setStandstill(bool standstill) { standstill_ = standstill; }
   const RelocOptions& relocOptions() const { return reloc_options_; }
   /// Commanded velocity (still.cmd_vel_topic): idle = zero for cmd_hold_sec.

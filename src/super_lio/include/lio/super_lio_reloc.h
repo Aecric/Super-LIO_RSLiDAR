@@ -67,6 +67,8 @@ private:
   void holdPose(bool cmd_idle);
   /// One scan of the post-acceptance window (reloc.verify); false discards the pose.
   bool verifyScan(const NavState& state, std::size_t matched);
+  /// The pose being verified came from the last GOOD pose and failed: forget it.
+  void dropLastPoseGuess();
   /// Localization: rebuild the search index from the fixed map plus extra
   /// points in the map frame (the modeled vehicle; empty = fixed map only).
   void rebuildFixedIndex(const BASIC::VV3& extra);

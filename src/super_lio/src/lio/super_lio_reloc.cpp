@@ -737,6 +737,15 @@ SuperLIOReLoc::Selection SuperLIOReLoc::selectCandidate(
 }
 
 
+void SuperLIOReLoc::dropLastPoseGuess() {
+  // Do not offer the same guess again: the next cold start goes to origin prior / KISS.
+  if (!init_from_last_pose_ || !has_last_good_pose_) return;
+  has_last_good_pose_ = false;
+  init_from_last_pose_ = false;
+  LOG(WARNING) << YELLOW << " ---> [Reloc] last pose rejected while verifying; not tried again" << RESET;
+}
+
+
 void SuperLIOReLoc::setVehicle(VV3 points, scalar yaw) {
   vehicle_points_ = std::move(points);
   rebuildFixedIndex(vehicle_points_);  // also drops a previous vehicle's map update
@@ -836,6 +845,8 @@ void SuperLIOReLoc::Output() {
                      << state.p.transpose() << "]" << RESET;
       }
       data_wrapper_->setLocState(4);
+      // Lost inside the verification window: the guess was wrong just the same.
+      if (verify_left_ > 0) dropLastPoseGuess();
       return;
     }
     if (verify_left_ > 0) {
@@ -843,8 +854,7 @@ void SuperLIOReLoc::Output() {
       if (!verifyScan(state, matched)) {
         verify_left_ = 0;
         verify_failed_ = true;
-        // Do not offer the same guess again: fall through to origin prior / KISS.
-        if (init_from_last_pose_) has_last_good_pose_ = false;
+        dropLastPoseGuess();
         return;
       }
       if (--verify_left_ > 0) return;

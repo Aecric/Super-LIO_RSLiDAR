@@ -278,7 +278,9 @@ class LocalizationSmoke(unittest.TestCase):
                                        '-p', 'reloc.origin_prior.y:=-1.0',
                                        '-p', 'reloc.origin_prior.z:=0.6',
                                        '-p', 'reloc.origin_prior.yaw_step_deg:=360.0',
-                                       '-p', 'runtime.still_dropout_max_sec:=3.0'],
+                                       '-p', 'runtime.still_dropout_max_sec:=3.0',
+                                       # Short hold: a command expires well before the IMU timeout.
+                                       '-p', 'still.cmd_hold_sec:=0.3'],
                                        stdout=log, stderr=log)
             rclpy.init()
             node = rclpy.create_node('dropout_smoke')
@@ -290,12 +292,17 @@ class LocalizationSmoke(unittest.TestCase):
             # A command source that stays at zero: the robot is standing (ZUPT / hold).
             cmd_pub = node.create_publisher(Twist, '/cmd_vel', 10)
 
-            def spin_for(seconds, feed, until=None):
-                end = time.monotonic() + seconds
+            def spin_for(seconds, feed, until=None, turn_for=0.):
+                start = time.monotonic()
+                end = start + seconds
                 counter = 0
                 while time.monotonic() < end and not (until and until()):
                     self.assertIsNone(process.poll(), 'localization node exited')
-                    if counter % 10 == 0:
+                    if time.monotonic() - start < turn_for:
+                        twist = Twist()
+                        twist.angular.z = .1
+                        cmd_pub.publish(twist)
+                    elif counter % 10 == 0:
                         cmd_pub.publish(Twist())
                     if feed:
                         stamp = node.get_clock().now().to_msg()
@@ -349,6 +356,20 @@ class LocalizationSmoke(unittest.TestCase):
                 self.assertIn('DEGRADED: sensor timeout while standing still', text)
                 self.assertIn('GOOD again', text)
                 self.assertNotIn('[Loc] LOST', text)
+
+                # A motion command during the dropout, expired before the timeout
+                # fires: the robot may have moved, so LOST, not DEGRADED.
+                mark = len(states)
+                spin_for(2, False, turn_for=.1)
+                self.assertIn(4, states[mark:] + [5], 'motion during a dropout must be LOST')
+                self.assertNotIn(3, states[mark:], 'motion during a dropout must not be DEGRADED')
+                self.assertIn('[Loc] LOST: sensor timeout, imu_age', node_log())
+                count = len(odoms)
+                spin_for(20, True, until=lambda: len(odoms) > count and states[-1] == 2)
+                self.assertGreater(len(odoms), count, 'must relocalize after LOST')
+                self.assertIn('last pose candidate 1/1 PASS', node_log())
+                check_pose()
+                spin_for(2, True)   # ZUPT / hold engage again
 
                 # Longer than runtime.still_dropout_max_sec: LOST, then the last
                 # GOOD pose is the first cold start candidate.

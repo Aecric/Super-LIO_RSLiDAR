@@ -170,8 +170,13 @@ void ROSWrapper::setupCmdVel() {
   auto on_cmd = [this](const geometry_msgs::msg::Twist& twist) {
     constexpr double kZero = 1e-3;
     if (std::abs(twist.linear.x) > kZero || std::abs(twist.linear.y) > kZero ||
-        std::abs(twist.angular.z) > kZero)
+        std::abs(twist.angular.z) > kZero) {
       last_cmd_motion_ = now().seconds();
+      // The robot may move before the next scan: a dropout from here on is not
+      // a standstill, even once this command has expired. Same thread as the
+      // watchdog and the scans (single-threaded executor).
+      standstill_ = false;
+    }
   };
   if (still.cmd_vel_stamped)
     cmd_vel_stamped_sub_ = create_subscription<geometry_msgs::msg::TwistStamped>(
