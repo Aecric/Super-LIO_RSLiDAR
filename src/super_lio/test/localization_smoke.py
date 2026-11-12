@@ -20,7 +20,7 @@ from nav_msgs.msg import Odometry, Path as RosPath
 from rclpy.qos import QoSProfile, DurabilityPolicy
 from sensor_msgs.msg import Imu, PointCloud2
 from std_msgs.msg import Int32, Float32MultiArray
-from std_srvs.srv import SetBool
+from std_srvs.srv import SetBool, Trigger
 from tf2_msgs.msg import TFMessage
 
 
@@ -501,6 +501,117 @@ class LocalizationSmoke(unittest.TestCase):
                     last = odoms[-1].pose.pose
                     self.assertAlmostEqual(last.position.x, 2., delta=.15)
                     self.assertAlmostEqual(last.position.y, -1., delta=.15)
+            except Exception:
+                print(node_log()[-12000:])
+                raise
+            finally:
+                node.destroy_node()
+                rclpy.shutdown()
+                process.send_signal(signal.SIGINT)
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+                log.close()
+
+    def test_dynamic_map_update_and_reset(self):
+        """Static obstacle addition commits global.pcd + map.pgm and resets to origin."""
+        from geometry_msgs.msg import Twist
+        executable = str(Path(get_package_prefix('super_lio')) / 'lib/super_lio/run_loclite_online')
+        config = str(Path(get_package_share_directory('super_lio')) / 'config/loclite_livox.yaml')
+        box_pts = [(2.2, y, z) for y in (-0.30, 0.0, 0.30) for z in (-0.40, -0.15, 0.10)]
+        with tempfile.TemporaryDirectory(prefix='super-lio-mapupdate-test-') as directory:
+            map_file = write_map(directory)
+            original = map_file.read_bytes()
+            log = open(Path(directory) / 'node.log', 'w+')
+            process = subprocess.Popen([
+                executable, '--config=' + config, '--map_path=' + directory,
+                '--ros-args',
+                '-p', 'reloc.origin_prior.x:=2.0',
+                '-p', 'reloc.origin_prior.y:=-1.0',
+                '-p', 'reloc.origin_prior.z:=0.6',
+                '-p', 'reloc.origin_prior.yaw_step_deg:=360.0',
+                '-p', 'map_update.kf_trans_thresh:=0.0',
+                '-p', 'map_update.kf_rot_thresh_deg:=0.0',
+                '-p', 'map_update.confirm_hits:=2',
+                '-p', 'map_update.confirm_min_age_sec:=0.1',
+                '-p', 'map_update.min_changed_voxels:=2',
+                '-p', 'map_update.min_cluster_voxels:=2',
+                '-p', 'map_update.commit_cooldown_sec:=0.2',
+                '-p', 'map_update.max_commit_defer_sec:=0.2',
+            ], stdout=log, stderr=log)
+            rclpy.init()
+            node = rclpy.create_node('map_update_smoke')
+            states, patches = [], []
+            node.create_subscription(Int32, '/hikari_loc/loc_state', lambda msg: states.append(msg.data), 10)
+            node.create_subscription(
+                PointCloud2, '/hikari_loc/map_patch', patches.append,
+                QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+            imu_pub = node.create_publisher(Imu, '/livox/imu', 50)
+            lidar_pub = node.create_publisher(CustomMsg, '/livox/lidar', 10)
+            cmd_pub = node.create_publisher(Twist, '/cmd_vel', 10)
+
+            def node_log():
+                log.flush()
+                log.seek(0)
+                return log.read()
+
+            def spin_for(seconds, moving=False, extra_pts=(), until=None):
+                end = time.monotonic() + seconds
+                counter = 0
+                pts = POINTS + list(extra_pts)
+                while time.monotonic() < end and not (until and until()):
+                    self.assertIsNone(process.poll(), 'localization node exited')
+                    if counter % 5 == 0:
+                        twist = Twist()
+                        if moving:
+                            twist.linear.x = 0.05
+                        cmd_pub.publish(twist)
+                    stamp = node.get_clock().now().to_msg()
+                    imu = Imu()
+                    imu.header.stamp = stamp
+                    imu.linear_acceleration.z = 9.7946
+                    imu_pub.publish(imu)
+                    if counter % 5 == 0:
+                        scan = CustomMsg()
+                        scan.header.stamp = stamp
+                        scan.point_num = len(pts)
+                        scan.points = [
+                            CustomPoint(
+                                x=float(x), y=float(y), z=float(z),
+                                reflectivity=10, tag=0, line=0,
+                                offset_time=int(i * 50_000_000 / len(pts)))
+                            for i, (x, y, z) in enumerate(pts)
+                        ]
+                        lidar_pub.publish(scan)
+                    counter += 1
+                    rclpy.spin_once(node, timeout_sec=.01)
+                    time.sleep(.01)
+
+            try:
+                spin_for(20, moving=False, until=lambda: 2 in states)
+                self.assertIn(2, states, 'cold start should reach GOOD')
+
+                origin_backup = Path(directory) / 'patch' / 'global.origin.pcd'
+                pgm_file = Path(directory) / 'map.pgm'
+                yaml_file = Path(directory) / 'map.yaml'
+
+                spin_for(
+                    10, moving=True, extra_pts=box_pts,
+                    until=lambda: 'swapped persisted map' in node_log())
+                self.assertTrue(patches and patches[-1].width > 0, 'map_patch should publish added voxels')
+                self.assertTrue(origin_backup.exists(), 'factory map backup must be created')
+                self.assertEqual(origin_backup.read_bytes(), original)
+                self.assertNotEqual(map_file.read_bytes(), original, 'global.pcd must be updated on commit')
+                self.assertTrue(pgm_file.exists() and yaml_file.exists(), 'map.pgm and map.yaml must be generated')
+
+                reset_client = node.create_client(Trigger, '/super_lio/reset_map_to_origin')
+                self.assertTrue(reset_client.wait_for_service(timeout_sec=2))
+                fut = reset_client.call_async(Trigger.Request())
+                rclpy.spin_until_future_complete(node, fut, timeout_sec=5)
+                self.assertTrue(fut.result().success, fut.result().message)
+                self.assertEqual(map_file.read_bytes(), original, 'reset_map_to_origin must restore factory PCD')
             except Exception:
                 print(node_log()[-12000:])
                 raise

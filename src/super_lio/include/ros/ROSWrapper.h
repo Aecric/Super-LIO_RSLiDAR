@@ -13,6 +13,7 @@
 #include <utility>
 #include <deque>
 #include <atomic>
+#include <functional>
 #include <vector>
 #include <execution>
 
@@ -26,6 +27,10 @@
 
 #include <sensor_msgs/msg/imu.hpp>
 #include <std_srvs/srv/set_bool.hpp>
+#include <std_srvs/srv/trigger.hpp>
+#ifdef SUPER_LIO_HAS_NAV2_MSGS
+#include <nav2_msgs/srv/load_map.hpp>
+#endif
 #include <nav_msgs/msg/path.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
@@ -105,6 +110,17 @@ public:
   bool takeVehicleLayerClear() { return std::exchange(vehicle_layer_clear_, false); }
   /// Debug: the points the map update added (map frame, latched).
   void pubVehicleLayer(const BASIC::VV3& points);
+  /// Debug: persistent L1 scene-change patch (+1 added, -1 carved, latched).
+  void pubMapPatch(const BASIC::CloudPtr& cloud);
+  /// Async notification to Nav2 map_server when map.pgm is updated on disk.
+  void notifyNav2MapReload(const std::string& yaml_path);
+  /// Hooks registered by SuperLIOReLoc for ~/reset_map_to_origin and standby flush.
+  void setResetMapHandler(std::function<bool(std::string&)> handler) {
+    reset_map_handler_ = std::move(handler);
+  }
+  void setStandbyHandler(std::function<void()> handler) {
+    standby_handler_ = std::move(handler);
+  }
   /// Relocalization blocks the executor for seconds; restart the input
   /// watchdog afterwards so the stall is not mistaken for a sensor dropout.
   void resetInputWatchdog() {
@@ -192,6 +208,13 @@ private:
   bool vehicle_collecting_ = false;
   bool vehicle_layer_clear_ = false;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr vehicle_layer_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr map_patch_pub_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr reset_map_srv_;
+  std::function<bool(std::string&)> reset_map_handler_;
+  std::function<void()> standby_handler_;
+#ifdef SUPER_LIO_HAS_NAV2_MSGS
+  rclcpp::Client<nav2_msgs::srv::LoadMap>::SharedPtr nav2_load_map_client_;
+#endif
   void setupParams();
   void setupIO();
   void createSensorSubscriptions();

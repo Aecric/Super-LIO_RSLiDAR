@@ -22,6 +22,7 @@ find_package(geometry_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
+find_package(nav2_msgs QUIET)
 find_package(pcl_ros REQUIRED)
 find_package(livox_ros_driver2 REQUIRED)
 find_package(super_lio_loop_msgs REQUIRED)
@@ -101,6 +102,11 @@ target_link_libraries(lio PUBLIC
   kiss_matcher::kiss_matcher_core
   TBB::tbb
 )
+
+if(nav2_msgs_FOUND)
+  target_compile_definitions(lio PUBLIC SUPER_LIO_HAS_NAV2_MSGS=1)
+  target_link_libraries(lio PUBLIC ${nav2_msgs_TARGETS})
+endif()
 
 add_executable(super_lio_node src/apps/super_lio_node.cpp)
 target_link_libraries(super_lio_node

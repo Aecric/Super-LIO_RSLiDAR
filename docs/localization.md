@@ -1,6 +1,6 @@
 # 固定地图纯定位模式
 
-该模式使用 Super-LIO 的 ESKF / OctVoxMap 跟踪已有 PCD 地图，入口、核心输出 topic 和 TF 坐标含义参照 [hikari_loclite](https://github.com/Aecric/hikari_loclite)。建图仍使用原有 `super_lio_node`。纯定位入口强制关闭地图更新、地图保存、关键帧发布和回环后端，即使配置误开这些开关也不会修改固定地图。
+该模式使用 Super-LIO 的 ESKF / OctVoxMap 跟踪已有 PCD 地图，入口、核心输出 topic 和 TF 坐标含义参照 [hikari_loclite](https://github.com/Aecric/hikari_loclite)。建图仍使用原有 `super_lio_node`。纯定位入口强制关闭建图模式的无约束点云累加、退出全量存图、关键帧发布和回环后端；场景局部变化通过受门控的 `map_update.*` 三层机制增量维护（L0 底图地面/高墙锚点锁定、L1 静态增删补丁与大变更异步落盘、L2 瞬态车辆作业层永不落盘）。
 
 ## 构建与运行
 
@@ -63,6 +63,11 @@ ros2 topic pub --once /initialpose geometry_msgs/msg/PoseWithCovarianceStamped \
 | `/hikari_loc/ndt_status` | `std_msgs/msg/Int32` | 固定 0，单层 NDT |
 | `/hikari_loc/loc_status` | `visualization_msgs/msg/Marker` | 定位状态文字 |
 | `/hikari_loc/status` | `std_msgs/msg/Float32MultiArray` | `[state, ndt_conf, imu_age_s, lidar_age_s, fps, in_map]` |
+| `/hikari_loc/map_patch` | `sensor_msgs/msg/PointCloud2` | L1 场景变化补丁点云（`+1` 新增、`-1` 擦除，transient-local） |
+
+### 动态改图与回滚服务
+
+启用 `map_update.enable`（默认开启）时，节点仅在状态 2（GOOD）、非验证窗口、非静止且 L0 底图支撑比例达标的关键帧上累积多视角证据，确认静态新增障碍或射线擦除已搬离的旧物体；`vehicle.*` 与 `/driverseat_*` 区域自动豁免且绝不写入持久层。当未提交的 L1 变更达到 `map_update.min_changed_voxels` 或连通块达到 `map_update.min_cluster_voxels` 时，后台线程先将出厂地图备份至 `<map_path>/patch/*.origin.*`，再原子更新 `global.pcd`、`map.pgm` / `map.yaml`（可选通知 `/map_server/load_map`）并热切换 NDT / GenZ-ICP / FC / KISS 目标点云。调用 `~/reset_map_to_origin`（`std_srvs/srv/Trigger`）可一键从备份还原出厂 `global.pcd` 与 `map.pgm` 并清空内存补丁。
 
 ### 定位状态
 
@@ -93,7 +98,7 @@ ros2 topic pub --once /initialpose geometry_msgs/msg/PoseWithCovarianceStamped \
 | 4 | 5 | 下一处理周期重置滤波器；若冷启动仍可用随即进入 1 自动重定位（先试本次运行最后一次 GOOD 位姿 `reloc.last_pose.*`，不通过再试原点先验与 KISS），否则等待 `/initialpose` |
 | 任意 | 1 | 收到新的 `/initialpose`：重置后重新配准 |
 | 任意 | 5 | `set_active` 停用 |
-- 姿态保持（`hold`）在状态 2 / 3 下运行，车旁地图更新只在状态 2 下运行，避免把未验证或已丢失的位姿写入结果。
+- 姿态保持（`hold`）在状态 2 / 3 下运行，车旁地图更新与 `map_update` 场景改图只在状态 2 下运行，避免把未验证或已丢失的位姿写入结果。
 - GOOD 仅表示通过初始化配准且跟踪有足够匹配，不代表 hikari_loclite 的完整稳定性/退化判定。
 
 `ndt_conf=-1` 表示不可用，不能把 PCL 的 ICP fitness 当成 hikari_loclite 的 NDT 置信度。未收到输入时 age 为 -1。状态以 5 Hz 发布；默认 IMU / 雷达掉线阈值为 1 / 2 秒。

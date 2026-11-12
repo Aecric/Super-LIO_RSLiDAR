@@ -10,3 +10,7 @@ src/CMakeLists.txt
 *map*
 !src/super_lio_loop_backend/include/super_lio_loop_backend/upstream/voxel_map.hpp
 !src/super_lio/thirdparty/**/robin_map.h
+!src/super_lio/include/lio/reloc/dynamic_map_updater.h
+!src/super_lio/src/lio/reloc/dynamic_map_updater.cpp
+build_eval/
+install_eval/

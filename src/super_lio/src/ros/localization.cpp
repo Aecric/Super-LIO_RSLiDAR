@@ -123,9 +123,60 @@ void ROSWrapper::setupLocalization() {
   r.fc.max_delta_rot_deg_kiss = declare_parameter<double>("reloc.fc.max_delta_rot_deg_kiss", r.fc.max_delta_rot_deg_kiss);
   r.fc.ambiguity_trans = declare_parameter<double>("reloc.fc.ambiguity_trans", r.fc.ambiguity_trans);
   r.fc.ambiguity_rot_deg = declare_parameter<double>("reloc.fc.ambiguity_rot_deg", r.fc.ambiguity_rot_deg);
+  auto& m = r.map_update;
+  m.enable = declare_parameter<bool>("map_update.enable", m.enable);
+  m.kf_trans_thresh = declare_parameter<double>("map_update.kf_trans_thresh", m.kf_trans_thresh);
+  m.kf_rot_thresh_deg = declare_parameter<double>("map_update.kf_rot_thresh_deg", m.kf_rot_thresh_deg);
+  m.min_match_ratio = declare_parameter<double>("map_update.min_match_ratio", m.min_match_ratio);
+  m.min_matched_points = declare_parameter<int>("map_update.min_matched_points", m.min_matched_points);
+  m.min_base_ratio = declare_parameter<double>("map_update.min_base_ratio", m.min_base_ratio);
+  m.min_base_matched = declare_parameter<int>("map_update.min_base_matched", m.min_base_matched);
+  m.max_speed = declare_parameter<double>("map_update.max_speed", m.max_speed);
+  m.max_angular_vel = declare_parameter<double>("map_update.max_angular_vel", m.max_angular_vel);
+  m.pause_during_driverseat = declare_parameter<bool>("map_update.pause_during_driverseat", m.pause_during_driverseat);
+  m.vehicle_exclude_margin = declare_parameter<double>("map_update.vehicle_exclude_margin", m.vehicle_exclude_margin);
+  m.ground_grid_res = declare_parameter<double>("map_update.ground_grid_res", m.ground_grid_res);
+  m.max_floor_variation = declare_parameter<double>("map_update.max_floor_variation", m.max_floor_variation);
+  m.obs_z_min = declare_parameter<double>("map_update.obs_z_min", m.obs_z_min);
+  m.obs_z_max = declare_parameter<double>("map_update.obs_z_max", m.obs_z_max);
+  m.min_range = declare_parameter<double>("map_update.min_range", m.min_range);
+  m.max_add_range = declare_parameter<double>("map_update.max_add_range", m.max_add_range);
+  m.max_carve_range = declare_parameter<double>("map_update.max_carve_range", m.max_carve_range);
+  m.confirm_hits = declare_parameter<int>("map_update.confirm_hits", m.confirm_hits);
+  m.confirm_min_age_sec = declare_parameter<double>("map_update.confirm_min_age_sec", m.confirm_min_age_sec);
+  m.carve_confirm_misses = declare_parameter<int>("map_update.carve_confirm_misses", m.carve_confirm_misses);
+  m.carve_added_misses = declare_parameter<int>("map_update.carve_added_misses", m.carve_added_misses);
+  m.carve_margin = declare_parameter<double>("map_update.carve_margin", m.carve_margin);
+  m.carve_ray_radius = declare_parameter<double>("map_update.carve_ray_radius", m.carve_ray_radius);
+  m.carve_min_baseline = declare_parameter<double>("map_update.carve_min_baseline", m.carve_min_baseline);
+  m.pending_ttl_sec = declare_parameter<double>("map_update.pending_ttl_sec", m.pending_ttl_sec);
+  m.min_changed_voxels = declare_parameter<int>("map_update.min_changed_voxels", m.min_changed_voxels);
+  m.min_cluster_voxels = declare_parameter<int>("map_update.min_cluster_voxels", m.min_cluster_voxels);
+  m.commit_cooldown_sec = declare_parameter<double>("map_update.commit_cooldown_sec", m.commit_cooldown_sec);
+  m.max_commit_defer_sec = declare_parameter<double>("map_update.max_commit_defer_sec", m.max_commit_defer_sec);
+  m.pgm.enable = declare_parameter<bool>("map_update.pgm.enable", m.pgm.enable);
+  m.pgm.create_if_missing = declare_parameter<bool>("map_update.pgm.create_if_missing", m.pgm.create_if_missing);
+  m.pgm.resolution = declare_parameter<double>("map_update.pgm.resolution", m.pgm.resolution);
+  m.pgm.z_min = declare_parameter<double>("map_update.pgm.z_min", m.pgm.z_min);
+  m.pgm.z_max = declare_parameter<double>("map_update.pgm.z_max", m.pgm.z_max);
+  m.pgm.reload_service = declare_parameter<std::string>("map_update.pgm.reload_service", m.pgm.reload_service);
   const bool kiss_voxels_ok = !r.kiss.voxel_sizes.empty() &&
       std::all_of(r.kiss.voxel_sizes.begin(), r.kiss.voxel_sizes.end(), [](double v) { return v >= 0.05; });
-  if (r.cold_start.max_attempts < 0 || !kiss_voxels_ok ||
+  const bool map_update_ok =
+      !m.enable ||
+      (m.kf_trans_thresh >= 0 && m.kf_rot_thresh_deg >= 0 &&
+       m.min_match_ratio >= 0 && m.min_match_ratio <= 1 && m.min_matched_points >= 10 &&
+       m.min_base_ratio >= 0 && m.min_base_ratio <= 1 && m.min_base_matched >= 5 &&
+       m.max_speed > 0 && m.max_angular_vel > 0 && m.vehicle_exclude_margin >= 0 &&
+       m.ground_grid_res >= 0.2 && m.max_floor_variation > 0 && m.obs_z_min < m.obs_z_max &&
+       m.min_range >= 0.1 && m.max_add_range > m.min_range && m.max_carve_range > m.min_range &&
+       m.confirm_hits >= 1 && m.confirm_min_age_sec >= 0 &&
+       m.carve_confirm_misses >= 1 && m.carve_added_misses >= 1 &&
+       m.carve_margin > 0 && m.carve_ray_radius > 0 && m.carve_min_baseline >= 0 &&
+       m.min_changed_voxels >= 1 && m.min_cluster_voxels >= 1 &&
+       m.commit_cooldown_sec >= 0 && m.max_commit_defer_sec >= 0 &&
+       (!m.pgm.enable || (m.pgm.resolution > 0 && m.pgm.z_min < m.pgm.z_max)));
+  if (!map_update_ok || r.cold_start.max_attempts < 0 || !kiss_voxels_ok ||
       r.still.cmd_hold_sec < 0 || r.still.max_gyro_mean <= 0 || r.still.max_gyro_std <= 0 ||
       r.still.max_acc_std <= 0 || r.zupt.velocity_sigma <= 0 || r.verify.frames < 0 ||
       r.hold.sigma_pos <= 0 || r.hold.sigma_rot_deg <= 0 || r.hold.max_offset <= 0 || r.hold.max_rot_deg <= 0 ||
@@ -152,6 +203,26 @@ void ROSWrapper::setupLocalization() {
   loc_marker_pub_ = create_publisher<visualization_msgs::msg::Marker>("hikari_loc/loc_status", 10);
   global_map_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
       "/pcdmap", rclcpp::QoS(1).reliable().transient_local());
+  map_patch_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
+      "hikari_loc/map_patch", rclcpp::QoS(1).reliable().transient_local());
+  reset_map_srv_ = create_service<std_srvs::srv::Trigger>(
+      "~/reset_map_to_origin",
+      [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+             std::shared_ptr<std_srvs::srv::Trigger::Response> res) {
+        if (!reset_map_handler_) {
+          res->success = false;
+          res->message = "Map reset handler is not initialized";
+          return;
+        }
+        std::string msg;
+        res->success = reset_map_handler_(msg);
+        res->message = msg;
+      });
+#ifdef SUPER_LIO_HAS_NAV2_MSGS
+  if (r.map_update.pgm.enable && !r.map_update.pgm.reload_service.empty()) {
+    nav2_load_map_client_ = create_client<nav2_msgs::srv::LoadMap>(r.map_update.pgm.reload_service);
+  }
+#endif
   loc_status_timer_ = create_wall_timer(std::chrono::milliseconds(200), [this]() { publishLocStatus(); });
   setupCmdVel();
   setupVehicleCloud();
@@ -299,6 +370,40 @@ void ROSWrapper::pubVehicleLayer(const VV3& points) {
   msg.header.frame_id = map_frame_;
   msg.header.stamp = now();
   vehicle_layer_pub_->publish(msg);
+}
+
+void ROSWrapper::pubMapPatch(const CloudPtr& cloud) {
+  if (!map_patch_pub_ || !cloud) return;
+  sensor_msgs::msg::PointCloud2 msg;
+  pcl::toROSMsg(*cloud, msg);
+  msg.header.frame_id = map_frame_;
+  msg.header.stamp = now();
+  map_patch_pub_->publish(msg);
+}
+
+void ROSWrapper::notifyNav2MapReload(const std::string& yaml_path) {
+  if (yaml_path.empty()) return;
+#ifdef SUPER_LIO_HAS_NAV2_MSGS
+  if (!nav2_load_map_client_ || !nav2_load_map_client_->service_is_ready()) return;
+  auto req = std::make_shared<nav2_msgs::srv::LoadMap::Request>();
+  req->map_url = yaml_path;
+  nav2_load_map_client_->async_send_request(
+      req, [yaml_path](rclcpp::Client<nav2_msgs::srv::LoadMap>::SharedFuture fut) {
+        try {
+          const auto resp = fut.get();
+          if (resp && resp->result == nav2_msgs::srv::LoadMap::Response::RESULT_SUCCESS) {
+            LOG(INFO) << GREEN << " ---> [MapUpdate] Nav2 map_server reloaded " << yaml_path << RESET;
+          } else {
+            LOG(WARNING) << YELLOW << " ---> [MapUpdate] Nav2 map_server reload returned code "
+                         << (resp ? static_cast<int>(resp->result) : -1) << RESET;
+          }
+        } catch (const std::exception& e) {
+          LOG(WARNING) << YELLOW << " ---> [MapUpdate] Nav2 reload exception: " << e.what() << RESET;
+        }
+      });
+#else
+  (void)yaml_path;
+#endif
 }
 
 bool ROSWrapper::takeVehicleUpdate(VV3& points, scalar& yaw) {
