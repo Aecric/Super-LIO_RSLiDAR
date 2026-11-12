@@ -89,6 +89,10 @@ private:
   std::unique_ptr<FcGate> fc_;
   pcl::NormalDistributionsTransform<BASIC::PointType, BASIC::PointType>::Ptr ndt_;
   int cold_start_attempts_ = 0;
+  // Last pose reported GOOD (T_map_imu): the first cold start guess. Survives Reset().
+  bool has_last_good_pose_ = false;
+  BASIC::SE3 last_good_pose_;
+  bool init_from_last_pose_ = false;  // the pose being verified came from it
   // Welford sums of squared deviations over the init window (per axis).
   BASIC::V3 init_m2_gyro_ = BASIC::V3::Zero();
   BASIC::V3 init_m2_acce_ = BASIC::V3::Zero();

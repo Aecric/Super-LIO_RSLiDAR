@@ -81,15 +81,23 @@
     runtime.publish_path: true
     runtime.imu_timeout_sec: 1.0
     runtime.lidar_timeout_sec: 2.0
+    # A timeout while standing still (ZUPT / pose hold active, command idle) keeps
+    # the pose and reports DEGRADED (3) instead of LOST; LOST once the robot is
+    # commanded or the dropout lasts this long. 0 = always LOST.
+    runtime.still_dropout_max_sec: 5.0
 
     # Initialization against the fixed map (keep the device still while it runs).
     #   /initialpose: guess -> NDT -> GenZ-ICP -> FC
     #   no initial pose (startup / after LOST): cold start
-    #     1. map origin with yaw hypotheses -> NDT -> GenZ-ICP -> FC
+    #     0. last GOOD pose of this run, if any -> NDT -> GenZ-ICP -> FC
+    #     1. if it fails: map origin with yaw hypotheses -> NDT -> GenZ-ICP -> FC
     #     2. if none passes: KISS-Matcher candidates -> NDT -> GenZ-ICP -> FC
     # An /initialpose received at any time takes over from the cold start.
     reloc.cold_start.enable: true
     reloc.cold_start.max_attempts: 0          # 0 = keep retrying until /initialpose
+    reloc.last_pose.enable: true
+    reloc.last_pose.max_delta_trans: 1.0      # m, FC: allowed distance from the last GOOD pose
+    reloc.last_pose.max_delta_rot_deg: 15.0   # deg
     # Standstill = commanded velocity zero for cmd_hold_sec AND IMU within the
     # limits below. cmd_vel is the main signal (the robot only moves when
     # commanded); the loose IMU limits only veto uncommanded motion (pushed,

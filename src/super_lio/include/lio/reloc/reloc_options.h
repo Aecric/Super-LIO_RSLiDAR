@@ -9,7 +9,10 @@ namespace LI2Sup {
 
 /// Fixed-map initialization pipeline (localization mode only):
 ///   /initialpose : guess                      -> NDT coarse -> GenZ-ICP -> FC
-///   cold start   : 1. map-origin prior (yaw sweep) -> NDT coarse -> GenZ-ICP -> FC
+///   cold start   : 0. last GOOD pose, if there was one (after LOST)
+///                                              -> NDT coarse -> GenZ-ICP -> FC
+///                  1. if it does not pass: map-origin prior (yaw sweep)
+///                                              -> NDT coarse -> GenZ-ICP -> FC
 ///                  2. only if no origin hypothesis passes:
 ///                     KISS-Matcher Top-K guesses -> NDT coarse -> GenZ-ICP -> FC
 /// All poses are T_map_imu; the query cloud is the accumulated init window.
@@ -107,6 +110,16 @@ struct RelocOptions {
       double min_range = 1.0;   // m from the sensor: robot body and arm never enter
     } update;
   } vehicle;
+
+  /// After LOST the robot is normally still where it was last tracked (a sensor
+  /// dropout while parked), which can be far from the map origin and in a view
+  /// KISS cannot solve. The cold start therefore first tries the last GOOD pose
+  /// of this run (position and yaw; roll/pitch from gravity).
+  struct LastPose {
+    bool enable = true;
+    double max_delta_trans = 1.0;       // FC: allowed distance from the last pose
+    double max_delta_rot_deg = 15.0;    // FC: allowed rotation from the last pose
+  } last_pose;
 
   /// Devices usually power up near where the map was started (map origin), so
   /// the cold start first tries that position with a set of yaw hypotheses.
