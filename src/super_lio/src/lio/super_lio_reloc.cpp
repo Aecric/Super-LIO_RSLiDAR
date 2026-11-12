@@ -160,7 +160,9 @@ void SuperLIOReLoc::Reset() {
 bool SuperLIOReLoc::coldStartArmed() const {
   const auto& options = data_wrapper_->relocOptions();
   const int max_attempts = options.cold_start.max_attempts;
-  return options.cold_start.enable && (kiss_ || options.origin_prior.enable) &&
+  // Any guess source arms it: KISS, the origin prior, or this run's last GOOD pose.
+  const bool last_pose = options.last_pose.enable && has_last_good_pose_;
+  return options.cold_start.enable && (kiss_ || options.origin_prior.enable || last_pose) &&
          (max_attempts == 0 || cold_start_attempts_ < max_attempts);
 }
 

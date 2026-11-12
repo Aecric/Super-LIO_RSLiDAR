@@ -397,6 +397,94 @@ class LocalizationSmoke(unittest.TestCase):
                     process.wait()
                 log.close()
 
+    def test_last_pose_only_recovery(self):
+        """No origin prior and no KISS: after /initialpose and LOST, the last GOOD
+        pose alone arms the cold start and relocalizes."""
+        executable = str(Path(get_package_prefix('super_lio')) / 'lib/super_lio/run_loclite_online')
+        config = str(Path(get_package_share_directory('super_lio')) / 'config/loclite_livox.yaml')
+        with tempfile.TemporaryDirectory(prefix='super-lio-lastpose-test-') as directory:
+            write_map(directory)
+            log = open(Path(directory) / 'node.log', 'w+')
+            process = subprocess.Popen([executable, '--config='+config, '--map_path='+directory,
+                                       '--ros-args', '-p', 'reloc.origin_prior.enable:=false',
+                                       # Map larger than the KISS limit: KISS disabled.
+                                       '-p', 'reloc.kiss.max_target_points:=10',
+                                       '-p', 'runtime.still_dropout_max_sec:=0.0'],
+                                       stdout=log, stderr=log)
+            rclpy.init()
+            node = rclpy.create_node('last_pose_smoke')
+            odoms, states = [], []
+            node.create_subscription(Odometry, '/hikari_loc/odom', odoms.append, 10)
+            node.create_subscription(Int32, '/hikari_loc/loc_state', lambda msg: states.append(msg.data), 10)
+            imu_pub = node.create_publisher(Imu, '/livox/imu', 50)
+            lidar_pub = node.create_publisher(CustomMsg, '/livox/lidar', 10)
+            initial_pub = node.create_publisher(PoseWithCovarianceStamped, '/initialpose', 1)
+
+            def spin_for(seconds, feed, until=None):
+                end = time.monotonic() + seconds
+                counter = 0
+                while time.monotonic() < end and not (until and until()):
+                    self.assertIsNone(process.poll(), 'localization node exited')
+                    if feed:
+                        stamp = node.get_clock().now().to_msg()
+                        imu = Imu()
+                        imu.header.stamp = stamp
+                        imu.linear_acceleration.z = 9.7946
+                        imu_pub.publish(imu)
+                        if counter % 5 == 0:
+                            scan = CustomMsg()
+                            scan.header.stamp = stamp
+                            scan.point_num = len(POINTS)
+                            scan.points = [CustomPoint(x=float(x), y=float(y), z=float(z),
+                                reflectivity=10, tag=0, line=0,
+                                offset_time=int(i * 50_000_000 / len(POINTS)))
+                                for i, (x, y, z) in enumerate(POINTS)]
+                            lidar_pub.publish(scan)
+                    counter += 1
+                    rclpy.spin_once(node, timeout_sec=.01)
+                    time.sleep(.01)
+
+            def node_log():
+                log.flush()
+                log.seek(0)
+                return log.read()
+
+            try:
+                spin_for(1.5, True)
+                self.assertFalse(odoms, 'no guess source: must wait for /initialpose')
+                self.assertNotIn('cold start: keep still', node_log())
+                pose = PoseWithCovarianceStamped()
+                pose.header.frame_id = 'map'
+                pose.pose.pose.position.x, pose.pose.pose.position.y, pose.pose.pose.position.z = 2., -1., .6
+                pose.pose.pose.orientation.z = math.sin(YAW/2)
+                pose.pose.pose.orientation.w = math.cos(YAW/2)
+                initial_pub.publish(pose)
+                spin_for(10, True, until=lambda: 2 in states)
+                self.assertIn(2, states, '/initialpose should reach GOOD')
+                mark = len(states)
+                spin_for(2, False)
+                self.assertTrue(4 in states[mark:] or 5 in states[mark:], 'dropout must be LOST')
+                count = len(odoms)
+                spin_for(20, True, until=lambda: len(odoms) > count)
+                self.assertGreater(len(odoms), count, 'last pose alone must relocalize')
+                self.assertIn('last pose candidate 1/1 PASS', node_log())
+                last = odoms[-1].pose.pose
+                self.assertAlmostEqual(last.position.x, 2., delta=.15)
+                self.assertAlmostEqual(last.position.y, -1., delta=.15)
+            except Exception:
+                print(node_log()[-12000:])
+                raise
+            finally:
+                node.destroy_node()
+                rclpy.shutdown()
+                process.send_signal(signal.SIGINT)
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+                log.close()
+
 
 if __name__ == '__main__':
     unittest.main()
