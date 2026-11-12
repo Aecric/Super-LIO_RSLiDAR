@@ -70,6 +70,12 @@ inline bool compute_error(
 }
 
 
+SuperLIOReLoc::~SuperLIOReLoc() {
+  if (map_updater_) {
+    map_updater_->flushSyncIfNeeded();
+  }
+}
+
 void SuperLIOReLoc::init(){
   ivox_.reset(new OctVoxMapType(OctVoxMapType::Options{g_ivox_resolution, g_ivox_capacity}));
   kf_.reset(new ESKF());
@@ -127,6 +133,10 @@ void SuperLIOReLoc::init(){
                                         options.origin_prior.enable ? (kiss_ ? "origin prior + KISS" : "origin prior")
                                                                     : (kiss_ ? "KISS" : "off"))
               << RESET;
+    data_wrapper_->setResetMapHandler([this](std::string& msg) { return resetMapToOrigin(msg); });
+    data_wrapper_->setStandbyHandler([this]() {
+      if (map_updater_) map_updater_->flushSyncIfNeeded();
+    });
   }
 
   state_fn_ = &SuperLIOReLoc::stateWaitKFInit;
@@ -154,6 +164,7 @@ void SuperLIOReLoc::Reset() {
   verify_left_ = 0;
   verify_failed_ = false;
   init_from_last_pose_ = false;  // the cached pose itself survives
+  if (map_updater_) map_updater_->onTrackingReset();
   data_wrapper_->setStandstill(false);
   if (data_wrapper_->localization()) data_wrapper_->setLocState(5);
 }
@@ -169,6 +180,12 @@ bool SuperLIOReLoc::coldStartArmed() const {
 
 void SuperLIOReLoc::process() {
   if (data_wrapper_->localization() && map_loaded_) {
+    if (map_updater_) {
+      DynamicMapUpdater::CommitResult commit;
+      if (map_updater_->pollCommitResult(commit)) {
+        applyCommitResult(std::move(commit));
+      }
+    }
     VV3 vehicle;
     scalar yaw = 0;
     if (data_wrapper_->takeVehicleUpdate(vehicle, yaw)) {
@@ -361,6 +378,9 @@ bool SuperLIOReLoc::map_init(){
   if (point_map_->empty()) return false;
 
   if (data_wrapper_->localization()) {
+    map_updater_ = std::make_unique<DynamicMapUpdater>(
+        g_save_map_dir, g_map_name, data_wrapper_->relocOptions());
+    map_updater_->setBaseMap(point_map_);
     rebuildFixedIndex({});
   } else {
     VV3 point_map_v3;
@@ -383,15 +403,24 @@ bool SuperLIOReLoc::map_init(){
 
 void SuperLIOReLoc::rebuildFixedIndex(const VV3& extra) {
   const auto start = std::chrono::steady_clock::now();
-  VV3 points;
-  points.reserve(point_map_->size() + extra.size());
-  for (const auto& point : *point_map_) points.emplace_back(point.x, point.y, point.z);
-  points.insert(points.end(), extra.begin(), extra.end());
   // No LRU eviction in a fixed map, even with a small configured capacity.
-  // Headroom for the vehicle-side map update, which never evicts.
-  const auto capacity = std::max(static_cast<std::size_t>(g_ivox_capacity), 2 * points.size() + 100000);
+  // Headroom for scene-change patches + vehicle-side map updates, which never evict.
+  const std::size_t base_sz = point_map_ ? point_map_->size() : 0;
+  const std::size_t patch_sz = map_updater_ ? map_updater_->addedCount() : 0;
+  const auto capacity = std::max(static_cast<std::size_t>(g_ivox_capacity),
+                                 2 * (base_sz + patch_sz + extra.size()) + 200000);
   ivox_.reset(new OctVoxMapType(OctVoxMapType::Options{g_ivox_resolution, capacity}));
-  ivox_->insert(points);
+  if (map_updater_) {
+    map_updater_->populateIndex(*ivox_, extra);
+  } else {
+    VV3 points;
+    points.reserve(base_sz + extra.size());
+    if (point_map_) {
+      for (const auto& point : *point_map_) points.emplace_back(point.x, point.y, point.z);
+    }
+    points.insert(points.end(), extra.begin(), extra.end());
+    ivox_->insert(points);
+  }
   if (extra.empty()) return;
   V3 lo = extra.front(), hi = extra.front();
   for (const auto& p : extra) {
@@ -772,11 +801,23 @@ void SuperLIOReLoc::setVehicle(VV3 points, scalar yaw) {
   const scalar margin = data_wrapper_->relocOptions().vehicle.update.margin;
   region_lo_ -= V3(margin, margin, 0.1);
   region_hi_ += V3(margin, margin, 0.5);
+  if (map_updater_) {
+    map_updater_->purgePendingInZone([this](const V3& p) { return inVehicleExclusionZone(p); });
+  }
 }
 
 bool SuperLIOReLoc::inVehicleRegion(const V3& p) const {
   const V3 box(vehicle_cos_ * p.x() + vehicle_sin_ * p.y(), -vehicle_sin_ * p.x() + vehicle_cos_ * p.y(), p.z());
   return (box.array() >= region_lo_.array()).all() && (box.array() <= region_hi_.array()).all();
+}
+
+bool SuperLIOReLoc::inVehicleExclusionZone(const V3& p) const {
+  if (vehicle_points_.empty()) return false;
+  const scalar pad = static_cast<scalar>(data_wrapper_->relocOptions().map_update.vehicle_exclude_margin);
+  const V3 lo = region_lo_ - V3(pad, pad, scalar(0.5));
+  const V3 hi = region_hi_ + V3(pad, pad, scalar(0.5));
+  const V3 box(vehicle_cos_ * p.x() + vehicle_sin_ * p.y(), -vehicle_sin_ * p.x() + vehicle_cos_ * p.y(), p.z());
+  return (box.array() >= lo.array()).all() && (box.array() <= hi.array()).all();
 }
 
 void SuperLIOReLoc::updateVehicleLayer() {
@@ -803,9 +844,122 @@ void SuperLIOReLoc::updateVehicleLayer() {
   if (ivox_->insertNew(points, &layer_cloud_) > 0) data_wrapper_->pubVehicleLayer(layer_cloud_);
 }
 
+void SuperLIOReLoc::updateDynamicMap() {
+  if (!map_updater_ || !data_wrapper_->relocOptions().map_update.enable) return;
+  if (data_wrapper_->locState() != 2 || verify_left_ > 0) return;
+
+  const auto state = kf_->GetSysState();
+  if (!state.p.allFinite() || !state.R.R_.allFinite() || !state.v.allFinite() || !state.bg.allFinite()) return;
+
+  const double stamp = state.timestamp > 0.0 ? state.timestamp : data_wrapper_->now().seconds();
+
+  if (!frame_still_) {
+    std::size_t matched = 0;
+    std::size_t base_matched = 0;
+    for (std::size_t i = 0; i < effect_knn_num_; ++i) {
+      const int idx = effect_knn_idxs_[i];
+      if (!effect_mask_[idx]) continue;
+      ++matched;
+      const V3 p_world = state.R.R_ * points_body_v3_[idx] + state.p;
+      if (ivox_->hasBaseSupport(p_world)) ++base_matched;
+    }
+
+    double omega_sum = 0.0;
+    for (const auto& imu : measures_.imu) {
+      omega_sum += (imu.gyr - state.bg).norm();
+    }
+    const double mean_omega = measures_.imu.empty() ? 0.0 : (omega_sum / measures_.imu.size());
+
+    DynamicMapUpdater::ScanUpdateInput in;
+    in.stamp = stamp;
+    in.pose = SE3(state.R, state.p);
+    in.lidar_lever_arm = g_lidar_imu.t_;
+    in.velocity = state.v;
+    in.angular_speed = mean_omega;
+    in.frame_still = frame_still_;
+    in.driverseat_collecting = layer_collecting_;
+    in.ds_size = ds_undistort_->size();
+    in.matched = matched;
+    in.base_matched = base_matched;
+    in.scan_undistort_imu = scan_undistort_full_.get();
+    in.in_vehicle_zone = [this](const V3& p) { return inVehicleExclusionZone(p); };
+
+    if (map_updater_->processScan(in, *ivox_)) {
+      data_wrapper_->pubMapPatch(map_updater_->buildPatchDebugCloud());
+    }
+  }
+
+  map_updater_->maybeScheduleCommit(stamp, frame_still_);
+}
+
+void SuperLIOReLoc::applyCommitResult(DynamicMapUpdater::CommitResult&& commit) {
+  if (!commit.success || !commit.updated_map) return;
+  point_map_ = commit.updated_map;
+  if (commit.ndt) ndt_ = commit.ndt;
+  if (commit.genz) genz_ = std::move(commit.genz);
+  if (commit.fc) fc_ = std::move(commit.fc);
+  if (data_wrapper_->relocOptions().cold_start.enable) {
+    kiss_ = std::move(commit.kiss);
+  }
+  data_wrapper_->set_global_map(point_map_);
+  if (commit.pgm_updated && !commit.map_yaml_path.empty()) {
+    data_wrapper_->notifyNav2MapReload(commit.map_yaml_path);
+  }
+  LOG(INFO) << GREEN << " ---> [MapUpdate] swapped persisted map & reloc targets (gen="
+            << commit.generation << ", points=" << point_map_->size()
+            << ", +L1=" << commit.added_voxels << ", -L1=" << commit.removed_voxels << ")" << RESET;
+}
+
+bool SuperLIOReLoc::resetMapToOrigin(std::string& message) {
+  if (!map_updater_) {
+    message = "DynamicMapUpdater is not initialized";
+    return false;
+  }
+  CloudPtr restored_map;
+  std::string yaml_path;
+  bool pgm_restored = false;
+  if (!map_updater_->resetToOrigin(restored_map, yaml_path, pgm_restored, message)) {
+    return false;
+  }
+
+  point_map_ = restored_map;
+  rebuildFixedIndex(vehicle_points_);
+  if (!layer_cloud_.empty()) {
+    ivox_->insert(layer_cloud_);
+  }
+
+  const auto& options = data_wrapper_->relocOptions();
+  ndt_.reset(new pcl::NormalDistributionsTransform<PointType, PointType>());
+  ndt_->setTransformationEpsilon(1e-4);
+  ndt_->setMaximumIterations(25);
+  ndt_->setResolution(1.0);
+  ndt_->setInputTarget(point_map_);
+
+  auto new_genz = std::make_unique<GenzRefiner>(options.genz);
+  auto new_fc = std::make_unique<FcGate>(options.fc);
+  if (new_genz->SetTarget(point_map_) && new_fc->SetTarget(point_map_)) {
+    genz_ = std::move(new_genz);
+    fc_ = std::move(new_fc);
+  }
+  if (options.cold_start.enable) {
+    auto new_kiss = std::make_unique<KissGlobalMatcher>(options.kiss);
+    if (new_kiss->SetTarget(point_map_)) kiss_ = std::move(new_kiss);
+    else kiss_.reset();
+  }
+
+  data_wrapper_->set_global_map(point_map_);
+  data_wrapper_->pubMapPatch(map_updater_->buildPatchDebugCloud());
+  if (pgm_restored && !yaml_path.empty()) {
+    data_wrapper_->notifyNav2MapReload(yaml_path);
+  }
+  LOG(INFO) << GREEN << " ---> [MapUpdate] reset_map_to_origin succeeded: " << message << RESET;
+  return true;
+}
+
 void SuperLIOReLoc::UpdateMap() {
   if (data_wrapper_->localization()) {
     updateVehicleLayer();
+    updateDynamicMap();
     return;
   }
   if(!g_update_map) return;

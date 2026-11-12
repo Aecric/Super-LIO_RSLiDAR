@@ -403,6 +403,7 @@ void ROSWrapper::setActive(bool active){
     active_.store(false, std::memory_order_release);
     destroySensorSubscriptions();
     clear();
+    if (standby_handler_) standby_handler_();
     LOG(INFO) << YELLOW << " ---> [Control] standby" << RESET;
   }
 }

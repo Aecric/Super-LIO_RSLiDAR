@@ -9,6 +9,7 @@
 #include <pcl/registration/ndt.h>
 
 #include "super_lio.h"
+#include "lio/reloc/dynamic_map_updater.h"
 #include "lio/reloc/fc_gate.h"
 #include "lio/reloc/genz_refiner.h"
 #include "lio/reloc/kiss_global_matcher.h"
@@ -28,7 +29,7 @@ public:
       
     re_init_pose_ = BASIC::SE3(BASIC::SO3(init_R2), init_t);
   };
-  ~SuperLIOReLoc(){};
+  ~SuperLIOReLoc();
 
   void init() override;
   void Reset() override;
@@ -77,9 +78,14 @@ private:
   /// Map update beside the vehicle (vehicle.update.*), one scan.
   void updateVehicleLayer();
   bool inVehicleRegion(const BASIC::V3& p) const;
+  bool inVehicleExclusionZone(const BASIC::V3& p) const;
+  void updateDynamicMap();
+  void applyCommitResult(DynamicMapUpdater::CommitResult&& commit);
+  bool resetMapToOrigin(std::string& message);
 
 private:
   bool map_loaded_ = false;
+  std::unique_ptr<DynamicMapUpdater> map_updater_;
   int init_frame_count_ = 0;
   bool has_init_pose_ = false;
   BASIC::CloudPtr init_obs_data_;

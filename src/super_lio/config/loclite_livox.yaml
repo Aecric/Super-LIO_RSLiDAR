@@ -189,3 +189,48 @@
     reloc.fc.max_delta_rot_deg_kiss: 30.0
     reloc.fc.ambiguity_trans: 1.0             # passing candidates further apart -> reject all
     reloc.fc.ambiguity_rot_deg: 10.0
+
+    # Automatic local scene-change map update (L0 immutable anchors + L1 persistent
+    # scene patch + L2 transient vehicle.*/driverseat business layer).
+    # Note: vehicle.* and driverseat points NEVER enter persisted global.pcd / map.pgm.
+    map_update.enable: true
+    map_update.kf_trans_thresh: 0.25          # m between update keyframes
+    map_update.kf_rot_thresh_deg: 5.0         # deg between update keyframes
+    map_update.min_match_ratio: 0.45          # matched / downsampled scan points
+    map_update.min_matched_points: 30
+    map_update.min_base_ratio: 0.50           # fraction of matched points anchored on L0 base map
+    map_update.min_base_matched: 20
+    map_update.max_speed: 1.5                 # m/s
+    map_update.max_angular_vel: 0.6           # rad/s
+    map_update.pause_during_driverseat: true  # freeze L1 updates while /driverseat_in collects
+    map_update.vehicle_exclude_margin: 0.5    # m extra buffer around active vehicle.update box
+    # Adaptive 2D local ground Z grid (handles negative / sloped ground automatically).
+    map_update.ground_grid_res: 1.5           # m XY cell size for floor height estimation
+    map_update.max_floor_variation: 1.5       # m max floor ramp range around global floor mode
+    map_update.obs_z_min: 0.10                # m above local floor (below: L0 ground locked)
+    map_update.obs_z_max: 2.00                # m above local floor (above: L0 upper walls locked)
+    # Multi-keyframe addition & real-return raycast carving.
+    map_update.min_range: 1.0                 # m from LiDAR optical center
+    map_update.max_add_range: 8.0             # m max range to confirm added static objects
+    map_update.max_carve_range: 9.0           # m max ray traversal for carving removed objects
+    map_update.confirm_hits: 5                # distinct keyframes to confirm a new sub-voxel
+    map_update.confirm_min_age_sec: 2.0       # s min timespan to filter walking people / carts
+    map_update.carve_confirm_misses: 8        # distinct keyframes to carve an L0 sub-voxel
+    map_update.carve_added_misses: 5          # distinct keyframes to carve an L1-added sub-voxel
+    map_update.carve_margin: 0.35             # m safety margin before distant surface return
+    map_update.carve_ray_radius: 0.12         # m max perpendicular distance from ray to centroid
+    map_update.carve_min_baseline: 0.25       # m min sensor baseline across carving views
+    map_update.pending_ttl_sec: 30.0          # s expire stale unconfirmed candidates
+    # Large-update background persistence (backups factory map to <map_path>/patch/*.origin.*,
+    # atomically updates global.pcd + map.pgm, and swaps NDT/GenZ/FC/KISS targets).
+    map_update.min_changed_voxels: 40         # total dirty 0.25 m sub-voxels (added + carved)
+    map_update.min_cluster_voxels: 16         # OR single connected dirty cluster (~1 m^2 object)
+    map_update.commit_cooldown_sec: 30.0      # s min interval between background commits
+    map_update.max_commit_defer_sec: 20.0     # s wait up to this long for standstill before commit
+    map_update.pgm.enable: true
+    map_update.pgm.create_if_missing: true
+    map_update.pgm.resolution: 0.05           # m/px when creating a new map.pgm
+    map_update.pgm.z_min: 0.10                # m above local floor
+    map_update.pgm.z_max: 1.50                # m above local floor
+    map_update.pgm.reload_service: "/map_server/load_map"
+
