@@ -153,6 +153,7 @@ void SuperLIOReLoc::Reset() {
   hold_set_ = false;
   verify_left_ = 0;
   verify_failed_ = false;
+  init_from_last_pose_ = false;  // the cached pose itself survives
   data_wrapper_->setStandstill(false);
   if (data_wrapper_->localization()) data_wrapper_->setLocState(5);
 }
@@ -624,6 +625,9 @@ bool SuperLIOReLoc::alignToMap(bool manual, const M3& level_rot, M4& T_map_imu) 
 
   Eigen::Matrix4d T;
   Selection selection = Selection::kNone;
+  // Set only when the last-pose candidate is the one accepted below; a manual
+  // or origin / KISS pose that fails verification must not drop the cached one.
+  init_from_last_pose_ = false;
   if (manual) {
     // /initialpose denotes map<-lidar, while the query is in IMU.
     selection = selectCandidate(
@@ -634,7 +638,6 @@ bool SuperLIOReLoc::alignToMap(bool manual, const M3& level_rot, M4& T_map_imu) 
     Eigen::Matrix4d T_level_imu = Eigen::Matrix4d::Identity();
     T_level_imu.block<3, 3>(0, 0) = level_rot.cast<double>();
 
-    init_from_last_pose_ = false;
     if (options.last_pose.enable && has_last_good_pose_) {
       // Position and yaw from the last GOOD pose, roll/pitch from this window's gravity.
       const Eigen::Matrix3d R_map_level =

@@ -400,6 +400,13 @@ class LocalizationSmoke(unittest.TestCase):
     def test_last_pose_only_recovery(self):
         """No origin prior and no KISS: after /initialpose and LOST, the last GOOD
         pose alone arms the cold start and relocalizes."""
+        self._last_pose_only_session()
+
+    def test_failed_manual_init_preserves_last_pose(self):
+        """A failed manual verification after last-pose recovery keeps the cache."""
+        self._last_pose_only_session(reject_manual=True)
+
+    def _last_pose_only_session(self, reject_manual=False):
         executable = str(Path(get_package_prefix('super_lio')) / 'lib/super_lio/run_loclite_online')
         config = str(Path(get_package_share_directory('super_lio')) / 'config/loclite_livox.yaml')
         with tempfile.TemporaryDirectory(prefix='super-lio-lastpose-test-') as directory:
@@ -420,7 +427,7 @@ class LocalizationSmoke(unittest.TestCase):
             lidar_pub = node.create_publisher(CustomMsg, '/livox/lidar', 10)
             initial_pub = node.create_publisher(PoseWithCovarianceStamped, '/initialpose', 1)
 
-            def spin_for(seconds, feed, until=None):
+            def spin_for(seconds, feed, until=None, points=POINTS):
                 end = time.monotonic() + seconds
                 counter = 0
                 while time.monotonic() < end and not (until and until()):
@@ -434,11 +441,11 @@ class LocalizationSmoke(unittest.TestCase):
                         if counter % 5 == 0:
                             scan = CustomMsg()
                             scan.header.stamp = stamp
-                            scan.point_num = len(POINTS)
+                            scan.point_num = len(points)
                             scan.points = [CustomPoint(x=float(x), y=float(y), z=float(z),
                                 reflectivity=10, tag=0, line=0,
-                                offset_time=int(i * 50_000_000 / len(POINTS)))
-                                for i, (x, y, z) in enumerate(POINTS)]
+                                offset_time=int(i * 50_000_000 / len(points)))
+                                for i, (x, y, z) in enumerate(points)]
                             lidar_pub.publish(scan)
                     counter += 1
                     rclpy.spin_once(node, timeout_sec=.01)
@@ -471,6 +478,29 @@ class LocalizationSmoke(unittest.TestCase):
                 last = odoms[-1].pose.pose
                 self.assertAlmostEqual(last.position.x, 2., delta=.15)
                 self.assertAlmostEqual(last.position.y, -1., delta=.15)
+                if reject_manual:
+                    # The last recovery left the initialization source as "last
+                    # pose". Accept a new manual registration, then feed scans
+                    # far outside the map during its verification window.
+                    mark = len(node_log())
+                    initial_pub.publish(pose)
+                    spin_for(10, True, until=lambda: '[Verify] tracking' in node_log()[mark:])
+                    self.assertIn('initialpose candidate 1/1 PASS', node_log()[mark:])
+                    self.assertIn('[Verify] tracking', node_log()[mark:])
+                    count = len(odoms)
+                    bad_points = [(x+30., y+30., z) for x, y, z in POINTS]
+                    spin_for(2, True, until=lambda: '[Loc] LOST:' in node_log()[mark:],
+                             points=bad_points)
+                    self.assertIn('[Loc] LOST:', node_log()[mark:], 'manual verification must fail')
+                    self.assertEqual(len(odoms), count, 'unverified manual pose must not be published')
+                    self.assertNotIn('last pose rejected while verifying', node_log()[mark:],
+                                     'manual verification must preserve the cached GOOD pose')
+                    spin_for(20, True, until=lambda: len(odoms) > count)
+                    self.assertGreater(len(odoms), count, 'cached pose must still arm automatic recovery')
+                    self.assertIn('last pose candidate 1/1 PASS', node_log()[mark:])
+                    last = odoms[-1].pose.pose
+                    self.assertAlmostEqual(last.position.x, 2., delta=.15)
+                    self.assertAlmostEqual(last.position.y, -1., delta=.15)
             except Exception:
                 print(node_log()[-12000:])
                 raise
