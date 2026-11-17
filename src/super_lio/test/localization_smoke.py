@@ -594,6 +594,7 @@ class LocalizationSmoke(unittest.TestCase):
                 self.assertIn(2, states, 'cold start should reach GOOD')
 
                 origin_backup = Path(directory) / 'patch' / 'global.origin.pcd'
+                pgm_origin_backup = Path(directory) / 'patch' / 'map.origin.pgm'
                 pgm_file = Path(directory) / 'map.pgm'
                 yaml_file = Path(directory) / 'map.yaml'
 
@@ -602,6 +603,7 @@ class LocalizationSmoke(unittest.TestCase):
                     until=lambda: 'swapped persisted map' in node_log())
                 self.assertTrue(patches and patches[-1].width > 0, 'map_patch should publish added voxels')
                 self.assertTrue(origin_backup.exists(), 'factory map backup must be created')
+                self.assertFalse(pgm_origin_backup.exists(), 'absent factory PGM must not be backed up')
                 self.assertEqual(origin_backup.read_bytes(), original)
                 self.assertNotEqual(map_file.read_bytes(), original, 'global.pcd must be updated on commit')
                 self.assertTrue(pgm_file.exists() and yaml_file.exists(), 'map.pgm and map.yaml must be generated')
@@ -612,6 +614,8 @@ class LocalizationSmoke(unittest.TestCase):
                 rclpy.spin_until_future_complete(node, fut, timeout_sec=5)
                 self.assertTrue(fut.result().success, fut.result().message)
                 self.assertEqual(map_file.read_bytes(), original, 'reset_map_to_origin must restore factory PCD')
+                self.assertFalse(pgm_file.exists() or yaml_file.exists(),
+                                 'reset_map_to_origin must remove generated occupancy files')
             except Exception:
                 print(node_log()[-12000:])
                 raise

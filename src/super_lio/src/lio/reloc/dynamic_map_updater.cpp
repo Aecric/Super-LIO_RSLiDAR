@@ -46,24 +46,40 @@ fs::path originPcdPath(const std::string& map_dir, const std::string& map_name) 
   return patchDirPath(map_dir) / (stem + ".origin" + ext);
 }
 
+bool replaceFileAtomic(const fs::path& tmp, const fs::path& dst) {
+  std::error_code rename_ec;
+  fs::rename(tmp, dst, rename_ec);
+  if (!rename_ec) return true;
+
+  std::error_code copy_ec;
+  fs::copy_file(tmp, dst, fs::copy_options::overwrite_existing, copy_ec);
+  std::error_code rm_ec;
+  fs::remove(tmp, rm_ec);
+  return !copy_ec;
+}
+
 bool copyFileAtomic(const fs::path& src, const fs::path& dst, const fs::path& tmp_dir) {
   std::error_code ec;
-  if (!fs::exists(src, ec)) return false;
+  const bool src_exists = fs::exists(src, ec);
+  if (ec || !src_exists) return false;
   fs::create_directories(tmp_dir, ec);
   if (ec) return false;
   const fs::path tmp = tmp_dir / ("." + dst.filename().string() + ".tmp");
   fs::copy_file(src, tmp, fs::copy_options::overwrite_existing, ec);
   if (ec) {
-    fs::remove(tmp, ec);
+    std::error_code rm_ec;
+    fs::remove(tmp, rm_ec);
     return false;
   }
-  fs::rename(tmp, dst, ec);
-  if (ec) {
-    fs::copy_file(tmp, dst, fs::copy_options::overwrite_existing, ec);
-    fs::remove(tmp, ec);
-    if (ec) return false;
-  }
-  return true;
+  return replaceFileAtomic(tmp, dst);
+}
+
+bool writeSentinelFile(const fs::path& path) {
+  std::ofstream ofs(path, std::ios::trunc);
+  if (!ofs.is_open()) return false;
+  ofs << "absent\n";
+  ofs.flush();
+  return ofs.good();
 }
 
 void mergeFineSample(VV3& samples, const V3& pt) {
@@ -91,6 +107,7 @@ struct MapYamlMeta {
   double resolution = 0.05;
   double origin_x = 0.0;
   double origin_y = 0.0;
+  double origin_yaw = 0.0;
   int negate = 0;
   bool valid = false;
 };
@@ -164,9 +181,13 @@ bool parseMapYaml(const fs::path& yaml_path, MapYamlMeta& meta) {
     }
   }
 
-  if (!has_res || origin_vals.size() < 2) return false;
+  if (!has_res || !std::isfinite(meta.resolution) || origin_vals.size() < 2) return false;
   meta.origin_x = origin_vals[0];
   meta.origin_y = origin_vals[1];
+  meta.origin_yaw = origin_vals.size() >= 3 ? origin_vals[2] : 0.0;
+  if (!std::isfinite(meta.origin_x) || !std::isfinite(meta.origin_y) || !std::isfinite(meta.origin_yaw)) {
+    return false;
+  }
   meta.valid = true;
   return true;
 }
@@ -254,15 +275,14 @@ bool writePgmAtomic(const fs::path& tmp_dir, const fs::path& dst_path, const Pgm
     ofs.write(reinterpret_cast<const char*>(img.pixels.data()),
               static_cast<std::streamsize>(img.pixels.size()));
     ofs.flush();
-    if (!ofs.good()) return false;
+    if (!ofs.good()) {
+      ofs.close();
+      std::error_code rm_ec;
+      fs::remove(tmp, rm_ec);
+      return false;
+    }
   }
-  fs::rename(tmp, dst_path, ec);
-  if (ec) {
-    fs::copy_file(tmp, dst_path, fs::copy_options::overwrite_existing, ec);
-    fs::remove(tmp, ec);
-    if (ec) return false;
-  }
-  return true;
+  return replaceFileAtomic(tmp, dst_path);
 }
 
 bool writeMapYamlAtomic(const fs::path& tmp_dir, const fs::path& yaml_path,
@@ -283,15 +303,14 @@ bool writeMapYamlAtomic(const fs::path& tmp_dir, const fs::path& yaml_path,
     ofs << "occupied_thresh: 0.65\n";
     ofs << "free_thresh: 0.25\n";
     ofs.flush();
-    if (!ofs.good()) return false;
+    if (!ofs.good()) {
+      ofs.close();
+      std::error_code rm_ec;
+      fs::remove(tmp, rm_ec);
+      return false;
+    }
   }
-  fs::rename(tmp, yaml_path, ec);
-  if (ec) {
-    fs::copy_file(tmp, yaml_path, fs::copy_options::overwrite_existing, ec);
-    fs::remove(tmp, ec);
-    if (ec) return false;
-  }
-  return true;
+  return replaceFileAtomic(tmp, yaml_path);
 }
 
 }  // namespace
@@ -590,20 +609,22 @@ void DynamicMapUpdater::onTrackingReset() {
   pending_add_.clear();
   carve_miss_.clear();
   has_last_kf_ = false;
+  last_cleanup_stamp_ = -1.0;
 }
 
 void DynamicMapUpdater::cleanupStaleCandidates(double now_sec) {
   const double ttl = options_.map_update.pending_ttl_sec;
   if (ttl <= 0.0 || now_sec <= 0.0) return;
+  last_cleanup_stamp_ = now_sec;
   for (auto it = pending_add_.begin(); it != pending_add_.end();) {
-    if (now_sec - it->second.last_stamp > ttl) {
+    if (now_sec < it->second.last_stamp || (now_sec - it->second.last_stamp) > ttl) {
       it = pending_add_.erase(it);
     } else {
       ++it;
     }
   }
   for (auto it = carve_miss_.begin(); it != carve_miss_.end();) {
-    if (now_sec - it->second.last_stamp > ttl) {
+    if (now_sec < it->second.last_stamp || (now_sec - it->second.last_stamp) > ttl) {
       it = carve_miss_.erase(it);
     } else {
       ++it;
@@ -646,7 +667,12 @@ bool DynamicMapUpdater::processScan(const ScanUpdateInput& input, OctVoxMapType&
   last_kf_pose_ = input.pose;
   has_last_kf_ = true;
 
-  if (++kf_counter_ % 20 == 0) {
+  const double ttl = cfg.pending_ttl_sec;
+  const bool time_due_cleanup =
+      ttl > 0.0 && input.stamp > 0.0 &&
+      (last_cleanup_stamp_ < 0.0 || input.stamp < last_cleanup_stamp_ ||
+       (input.stamp - last_cleanup_stamp_) >= std::min(5.0, ttl));
+  if (++kf_counter_ % 20 == 0 || time_due_cleanup) {
     cleanupStaleCandidates(input.stamp);
   }
 
@@ -722,13 +748,21 @@ bool DynamicMapUpdater::processScan(const ScanUpdateInput& input, OctVoxMapType&
   bool patch_changed = false;
   const float obs_z_min = static_cast<float>(cfg.obs_z_min);
   const float obs_z_max = static_cast<float>(cfg.obs_z_max);
+  const auto is_stale = [&](double last_stamp) {
+    return ttl > 0.0 && input.stamp > 0.0 &&
+           (input.stamp < last_stamp || (input.stamp - last_stamp) > ttl);
+  };
 
   // Step A: Direct obstacle hits -> decay carve misses & accumulate static additions.
   for (const auto& [fk, bucket] : add_hits) {
     // Any direct hit in this sub-voxel resets/decays pending carve evidence.
     if (auto cit = carve_miss_.find(fk); cit != carve_miss_.end()) {
-      cit->second.count = std::max(0, cit->second.count - 2);
-      if (cit->second.count == 0) carve_miss_.erase(cit);
+      if (is_stale(cit->second.last_stamp)) {
+        carve_miss_.erase(cit);
+      } else {
+        cit->second.count = std::max(0, cit->second.count - 2);
+        if (cit->second.count == 0) carve_miss_.erase(cit);
+      }
     }
 
     const V3 pt = bucket.sum / static_cast<scalar>(bucket.count);
@@ -751,6 +785,10 @@ bool DynamicMapUpdater::processScan(const ScanUpdateInput& input, OctVoxMapType&
 
     auto [pit, inserted] = pending_add_.try_emplace(fk);
     PendingAdd& cand = pit->second;
+    if (!inserted && is_stale(cand.last_stamp)) {
+      cand = PendingAdd{};
+      inserted = true;
+    }
     if (inserted) {
       cand.mean_pt = pt;
       cand.fine_points = bucket.fine_samples;
@@ -786,8 +824,10 @@ bool DynamicMapUpdater::processScan(const ScanUpdateInput& input, OctVoxMapType&
   // Step B: Real-return ray traversal -> free-space carving of removed static objects.
   const float ray_radius2 = static_cast<float>(cfg.carve_ray_radius * cfg.carve_ray_radius);
   const float step_len = std::max(0.12f, 0.75f * sub_resolution_);
-  std::unordered_set<FineKey, FineKeyHash> missed_this_kf;
-  missed_this_kf.reserve(512);
+  std::unordered_set<FineKey, FineKeyHash> penalized_pending_kf;
+  std::unordered_set<FineKey, FineKeyHash> carved_vox_kf;
+  penalized_pending_kf.reserve(256);
+  carved_vox_kf.reserve(512);
 
   for (const auto& [ray_key, p_hit] : carve_ray_endpoints) {
     const V3 delta = p_hit - sensor_origin;
@@ -807,17 +847,31 @@ bool DynamicMapUpdater::processScan(const ScanUpdateInput& input, OctVoxMapType&
 
       if (protected_carve_keys.count(fk)) continue;
 
-      // Penalize unconfirmed transient candidates traversed by a behind-hit ray
-      // (at most once per keyframe).
-      const bool first_visit_in_kf = missed_this_kf.insert(fk).second;
-      if (!first_visit_in_kf) continue;
-
-      if (auto pit = pending_add_.find(fk); pit != pending_add_.end()) {
-        pit->second.misses += 1;
-        if (pit->second.misses >= 3 && pit->second.misses > pit->second.hits) {
-          pending_add_.erase(pit);
+      // Penalize unconfirmed transient candidates traversed closely by a behind-hit ray
+      // (at most once per keyframe, deduplicated only after validating ray proximity).
+      if (!penalized_pending_kf.count(fk)) {
+        if (auto pit = pending_add_.find(fk); pit != pending_add_.end()) {
+          if (is_stale(pit->second.last_stamp)) {
+            pending_add_.erase(pit);
+          } else {
+            const V3 rel_p = pit->second.mean_pt - sensor_origin;
+            const float proj_p = static_cast<float>(rel_p.dot(dir));
+            if (proj_p > min_r && proj_p < d_hit - carve_margin) {
+              const float perp2_p =
+                  static_cast<float>((rel_p - dir * static_cast<scalar>(proj_p)).squaredNorm());
+              if (perp2_p <= ray_radius2) {
+                penalized_pending_kf.insert(fk);
+                pit->second.misses += 1;
+                if (pit->second.misses >= 3 && pit->second.misses > pit->second.hits) {
+                  pending_add_.erase(pit);
+                }
+              }
+            }
+          }
         }
       }
+
+      if (carved_vox_kf.count(fk)) continue;
 
       V3 vox_pt;
       bool is_base = false;
@@ -837,8 +891,15 @@ bool DynamicMapUpdater::processScan(const ScanUpdateInput& input, OctVoxMapType&
       const float perp2 = static_cast<float>((rel - dir * static_cast<scalar>(proj)).squaredNorm());
       if (perp2 > ray_radius2) continue;
 
+      // Deduplicate only after projection and perpendicular-distance validation succeed.
+      carved_vox_kf.insert(fk);
+
       auto [mit, inserted] = carve_miss_.try_emplace(fk);
       CarveMiss& cm = mit->second;
+      if (!inserted && is_stale(cm.last_stamp)) {
+        cm = CarveMiss{};
+        inserted = true;
+      }
       if (inserted) {
         cm.first_origin = sensor_origin;
         cm.max_baseline = 0.0f;
@@ -1033,34 +1094,30 @@ bool DynamicMapUpdater::pollCommitResult(CommitResult& out) {
   return true;
 }
 
-bool DynamicMapUpdater::flushSyncIfNeeded() {
+bool DynamicMapUpdater::flushSyncIfNeeded(bool rebuild_reloc_targets, CommitResult* out_result) {
   const auto& cfg = options_.map_update;
   if (!cfg.enable || !base_map_ || base_map_->empty()) return false;
 
+  // Finish any running background commit and consume its result rather than discarding it.
   joinCommitThread();
-  {
-    std::lock_guard<std::mutex> lock(result_mutex_);
-    if (pending_result_ && pending_result_->success && pending_result_->generation == generation_) {
-      committed_added_keys_.clear();
-      for (const auto& [fk, vox] : inflight_added_snapshot_) {
-        committed_added_keys_.insert(fk);
-      }
-      committed_removed_keys_ = inflight_removed_snapshot_;
-      pending_result_.reset();
-    }
-  }
+  CommitResult completed_bg;
+  const bool had_bg = pollCommitResult(completed_bg);
 
   std::unordered_set<FineKey, FineKeyHash> newly_occupied;
   std::unordered_set<FineKey, FineKeyHash> newly_cleared;
   computeDirtySets(newly_occupied, newly_cleared);
   const std::size_t total_dirty = newly_occupied.size() + newly_cleared.size();
-  if (total_dirty == 0) return false;
-
   const bool meets_total = static_cast<int>(total_dirty) >= cfg.min_changed_voxels;
   const bool meets_cluster =
-      meets_total ||
-      static_cast<int>(computeMaxClusterSize(newly_occupied, newly_cleared)) >= cfg.min_cluster_voxels;
-  if (!meets_total && !meets_cluster) return false;
+      total_dirty > 0 &&
+      (meets_total ||
+       static_cast<int>(computeMaxClusterSize(newly_occupied, newly_cleared)) >= cfg.min_cluster_voxels);
+  if (!meets_total && !meets_cluster) {
+    if (had_bg && out_result) {
+      *out_result = std::move(completed_bg);
+    }
+    return had_bg;
+  }
 
   CommitJob job;
   job.generation = ++generation_;
@@ -1074,16 +1131,30 @@ bool DynamicMapUpdater::flushSyncIfNeeded() {
   job.removed_subvoxels = removed_subvoxels_;
   job.newly_occupied = std::move(newly_occupied);
   job.newly_cleared = std::move(newly_cleared);
-  job.rebuild_reloc_targets = false;  // Shutdown / standby flush: only disk files needed.
+  job.rebuild_reloc_targets = rebuild_reloc_targets && (out_result != nullptr);
 
-  LOG(INFO) << " ---> [MapUpdate] synchronous flush on standby/exit (dirty=" << total_dirty << ")";
-  const CommitResult res = executeCommitJob(job);
-  if (!res.success) return false;
+  LOG(INFO) << " ---> [MapUpdate] synchronous flush (dirty=" << total_dirty
+            << ", rebuild_targets=" << (job.rebuild_reloc_targets ? "true" : "false") << ")";
+  CommitResult res = executeCommitJob(job);
+  if (!res.success) {
+    if (had_bg && out_result) {
+      *out_result = std::move(completed_bg);
+    }
+    return had_bg;
+  }
+
+  if (!res.pgm_updated && had_bg && completed_bg.pgm_updated) {
+    res.pgm_updated = true;
+    res.map_yaml_path = completed_bg.map_yaml_path;
+  }
 
   committed_added_keys_.clear();
   for (const auto& [fk, vox] : added_voxels_) committed_added_keys_.insert(fk);
   committed_removed_keys_ = removed_subvoxels_;
   dirty_since_time_ = -1.0;
+  if (out_result) {
+    *out_result = std::move(res);
+  }
   return true;
 }
 
@@ -1143,29 +1214,61 @@ bool DynamicMapUpdater::ensureOriginBackup(const std::string& map_dir,
 
   const fs::path cur_pcd = fs::path(map_dir) / map_name;
   const fs::path orig_pcd = originPcdPath(map_dir, map_name);
-  if (!fs::exists(orig_pcd, ec)) {
-    if (!copyFileAtomic(cur_pcd, orig_pcd, patch_dir)) {
-      LOG(ERROR) << " ---> [MapUpdate] failed to back up origin PCD to " << orig_pcd.string();
-      return false;
-    }
-    LOG(INFO) << " ---> [MapUpdate] backed up factory origin map to " << orig_pcd.string();
+  const bool has_orig_pcd = fs::exists(orig_pcd, ec);
+  if (ec) return false;
+  if (has_orig_pcd) {
+    // Factory snapshot was already captured before the first commit; never overwrite
+    // occupancy origin backups with files generated on later commits.
+    return true;
   }
 
   const fs::path cur_pgm = fs::path(map_dir) / "map.pgm";
   const fs::path orig_pgm = patch_dir / "map.origin.pgm";
-  if (fs::exists(cur_pgm, ec) && !fs::exists(orig_pgm, ec)) {
+  const fs::path absent_pgm = patch_dir / "map.origin.pgm.absent";
+  const bool has_cur_pgm = fs::exists(cur_pgm, ec);
+  if (ec) return false;
+  if (has_cur_pgm) {
     if (!copyFileAtomic(cur_pgm, orig_pgm, patch_dir)) {
-      LOG(WARNING) << " ---> [MapUpdate] failed to back up map.origin.pgm";
+      LOG(ERROR) << " ---> [MapUpdate] failed to back up map.origin.pgm";
+      return false;
+    }
+    std::error_code rm_ec;
+    fs::remove(absent_pgm, rm_ec);
+  } else {
+    std::error_code rm_ec;
+    fs::remove(orig_pgm, rm_ec);
+    if (!writeSentinelFile(absent_pgm)) {
+      LOG(ERROR) << " ---> [MapUpdate] failed to record map.origin.pgm.absent";
+      return false;
     }
   }
 
   const fs::path cur_yaml = fs::path(map_dir) / "map.yaml";
   const fs::path orig_yaml = patch_dir / "map.origin.yaml";
-  if (fs::exists(cur_yaml, ec) && !fs::exists(orig_yaml, ec)) {
+  const fs::path absent_yaml = patch_dir / "map.origin.yaml.absent";
+  const bool has_cur_yaml = fs::exists(cur_yaml, ec);
+  if (ec) return false;
+  if (has_cur_yaml) {
     if (!copyFileAtomic(cur_yaml, orig_yaml, patch_dir)) {
-      LOG(WARNING) << " ---> [MapUpdate] failed to back up map.origin.yaml";
+      LOG(ERROR) << " ---> [MapUpdate] failed to back up map.origin.yaml";
+      return false;
+    }
+    std::error_code rm_ec;
+    fs::remove(absent_yaml, rm_ec);
+  } else {
+    std::error_code rm_ec;
+    fs::remove(orig_yaml, rm_ec);
+    if (!writeSentinelFile(absent_yaml)) {
+      LOG(ERROR) << " ---> [MapUpdate] failed to record map.origin.yaml.absent";
+      return false;
     }
   }
+
+  if (!copyFileAtomic(cur_pcd, orig_pcd, patch_dir)) {
+    LOG(ERROR) << " ---> [MapUpdate] failed to back up origin PCD to " << orig_pcd.string();
+    return false;
+  }
+  LOG(INFO) << " ---> [MapUpdate] backed up factory origin map to " << orig_pcd.string();
   return true;
 }
 
@@ -1179,16 +1282,11 @@ bool DynamicMapUpdater::writePcdAtomic(const std::string& map_dir,
 
   const fs::path tmp_pcd = patch_dir / ".global.pcd.tmp";
   if (pcl::io::savePCDFileBinary(tmp_pcd.string(), cloud) != 0) {
-    fs::remove(tmp_pcd, ec);
+    std::error_code rm_ec;
+    fs::remove(tmp_pcd, rm_ec);
     return false;
   }
-  fs::rename(tmp_pcd, fs::path(target_path), ec);
-  if (ec) {
-    fs::copy_file(tmp_pcd, fs::path(target_path), fs::copy_options::overwrite_existing, ec);
-    fs::remove(tmp_pcd, ec);
-    if (ec) return false;
-  }
-  return true;
+  return replaceFileAtomic(tmp_pcd, fs::path(target_path));
 }
 
 bool DynamicMapUpdater::syncPgmMap(const CommitJob& job, const PointCloudType& updated_map,
@@ -1206,7 +1304,17 @@ bool DynamicMapUpdater::syncPgmMap(const CommitJob& job, const PointCloudType& u
   const float sub_res = 1.0f / job.sub_inv_resolution;
 
   std::error_code ec;
-  if (fs::exists(pgm_path, ec) && fs::exists(yaml_path, ec)) {
+  const bool has_pgm = fs::exists(pgm_path, ec);
+  if (ec) return false;
+  const bool has_yaml = fs::exists(yaml_path, ec);
+  if (ec) return false;
+  if (has_pgm != has_yaml) {
+    LOG(WARNING) << " ---> [MapUpdate] incomplete existing occupancy map (pgm=" << has_pgm
+                 << ", yaml=" << has_yaml << "); skipping PGM sync";
+    return false;
+  }
+
+  if (has_pgm && has_yaml) {
     MapYamlMeta meta;
     PgmImage img;
     if (!parseMapYaml(yaml_path, meta) || !readPgmFile(pgm_path, img)) {
@@ -1217,6 +1325,14 @@ bool DynamicMapUpdater::syncPgmMap(const CommitJob& job, const PointCloudType& u
     const uint8_t occ_val = (meta.negate == 1) ? 254 : 0;
     const uint8_t free_val = (meta.negate == 1) ? 0 : 254;
     const double inv_res = 1.0 / meta.resolution;
+    const double cos_yaw = std::cos(meta.origin_yaw);
+    const double sin_yaw = std::sin(meta.origin_yaw);
+    const bool rotated = std::abs(meta.origin_yaw) > 1e-6;
+    const auto world_to_uv = [&](double wx, double wy) -> std::pair<double, double> {
+      const double dx = wx - meta.origin_x;
+      const double dy = wy - meta.origin_y;
+      return {cos_yaw * dx + sin_yaw * dy, -sin_yaw * dx + cos_yaw * dy};
+    };
 
     // 1. Clear pixels inside newly carved 3D obstacle footprints (preserving GIMP virtual walls elsewhere).
     for (const auto& fk : job.newly_cleared) {
@@ -1225,15 +1341,39 @@ bool DynamicMapUpdater::syncPgmMap(const CommitJob& job, const PointCloudType& u
       const double y0 = fk.y() * sub_res;
       const double y1 = (fk.y() + 1) * sub_res;
 
-      const int ix0 = std::max(0, static_cast<int>(std::floor((x0 - meta.origin_x) * inv_res)));
-      const int ix1 = std::min(img.width - 1, static_cast<int>(std::floor((x1 - 1e-5 - meta.origin_x) * inv_res)));
-      const int iy0 = std::max(0, static_cast<int>(std::floor((y0 - meta.origin_y) * inv_res)));
-      const int iy1 = std::min(img.height - 1, static_cast<int>(std::floor((y1 - 1e-5 - meta.origin_y) * inv_res)));
+      const auto [u00, v00] = world_to_uv(x0, y0);
+      const auto [u10, v10] = world_to_uv(x1, y0);
+      const auto [u01, v01] = world_to_uv(x0, y1);
+      const auto [u11, v11] = world_to_uv(x1, y1);
+      const double min_u = std::min({u00, u10, u01, u11});
+      const double max_u = std::max({u00, u10, u01, u11});
+      const double min_v = std::min({v00, v10, v01, v11});
+      const double max_v = std::max({v00, v10, v01, v11});
+
+      const int ix0 = std::max(0, static_cast<int>(std::floor(min_u * inv_res)));
+      const int ix1 = std::min(img.width - 1, static_cast<int>(std::floor((max_u - 1e-5) * inv_res)));
+      const int iy0 = std::max(0, static_cast<int>(std::floor(min_v * inv_res)));
+      const int iy1 = std::min(img.height - 1, static_cast<int>(std::floor((max_v - 1e-5) * inv_res)));
 
       for (int iy = iy0; iy <= iy1; ++iy) {
         const int row = img.height - 1 - iy;
         for (int ix = ix0; ix <= ix1; ++ix) {
+          if (rotated) {
+            const double uc = (static_cast<double>(ix) + 0.5) * meta.resolution;
+            const double vc = (static_cast<double>(iy) + 0.5) * meta.resolution;
+            const double wx = meta.origin_x + cos_yaw * uc - sin_yaw * vc;
+            const double wy = meta.origin_y + sin_yaw * uc + cos_yaw * vc;
+            if (wx < x0 || wx > x1 || wy < y0 || wy > y1) continue;
+          }
           img.pixels[static_cast<std::size_t>(row) * img.width + ix] = free_val;
+        }
+      }
+      if (rotated) {
+        const auto [uc_vox, vc_vox] = world_to_uv(0.5 * (x0 + x1), 0.5 * (y0 + y1));
+        const int cix = static_cast<int>(std::floor(uc_vox * inv_res));
+        const int ciy = static_cast<int>(std::floor(vc_vox * inv_res));
+        if (cix >= 0 && cix < img.width && ciy >= 0 && ciy < img.height) {
+          img.pixels[static_cast<std::size_t>(img.height - 1 - ciy) * img.width + cix] = free_val;
         }
       }
     }
@@ -1260,8 +1400,9 @@ bool DynamicMapUpdater::syncPgmMap(const CommitJob& job, const PointCloudType& u
       const float h = pt.z - job.ground_grid.query(pt.x, pt.y);
       if (h < z_min || h > z_max) continue;
 
-      const int ix = static_cast<int>(std::floor((pt.x - meta.origin_x) * inv_res));
-      const int iy = static_cast<int>(std::floor((pt.y - meta.origin_y) * inv_res));
+      const auto [u, v] = world_to_uv(pt.x, pt.y);
+      const int ix = static_cast<int>(std::floor(u * inv_res));
+      const int iy = static_cast<int>(std::floor(v * inv_res));
       if (ix < 0 || ix >= img.width || iy < 0 || iy >= img.height) continue;
       const int row = img.height - 1 - iy;
       img.pixels[static_cast<std::size_t>(row) * img.width + ix] = occ_val;
@@ -1431,20 +1572,52 @@ bool DynamicMapUpdater::resetToOrigin(CloudPtr& restored_map, std::string& out_y
 
     const fs::path orig_pgm = patch_dir / "map.origin.pgm";
     const fs::path orig_yaml = patch_dir / "map.origin.yaml";
+    const fs::path absent_pgm = patch_dir / "map.origin.pgm.absent";
+    const fs::path absent_yaml = patch_dir / "map.origin.yaml.absent";
     const fs::path target_pgm = fs::path(map_dir_) / "map.pgm";
     const fs::path target_yaml = fs::path(map_dir_) / "map.yaml";
+    bool pgm_removed = false;
+
     if (fs::exists(orig_pgm, ec)) {
-      pgm_restored = copyFileAtomic(orig_pgm, target_pgm, patch_dir);
+      if (!copyFileAtomic(orig_pgm, target_pgm, patch_dir)) {
+        message = "Failed to copy origin PGM backup back to " + target_pgm.string();
+        return false;
+      }
+      pgm_restored = true;
+    } else if (fs::exists(absent_pgm, ec) || !fs::exists(orig_pgm, ec)) {
+      if (fs::exists(target_pgm, ec)) {
+        std::error_code rm_ec;
+        fs::remove(target_pgm, rm_ec);
+        if (rm_ec && fs::exists(target_pgm, ec)) {
+          message = "Failed to remove generated " + target_pgm.string();
+          return false;
+        }
+        pgm_removed = true;
+      }
     }
+
     if (fs::exists(orig_yaml, ec)) {
-      if (copyFileAtomic(orig_yaml, target_yaml, patch_dir)) {
-        out_yaml_path = target_yaml.string();
+      if (!copyFileAtomic(orig_yaml, target_yaml, patch_dir)) {
+        message = "Failed to copy origin YAML backup back to " + target_yaml.string();
+        return false;
+      }
+      out_yaml_path = target_yaml.string();
+    } else if (fs::exists(absent_yaml, ec) || !fs::exists(orig_yaml, ec)) {
+      if (fs::exists(target_yaml, ec)) {
+        std::error_code rm_ec;
+        fs::remove(target_yaml, rm_ec);
+        if (rm_ec && fs::exists(target_yaml, ec)) {
+          message = "Failed to remove generated " + target_yaml.string();
+          return false;
+        }
       }
     }
 
     setBaseMap(loaded);
     restored_map = loaded;
-    message = "Restored global.pcd" + std::string(pgm_restored ? " and map.pgm" : "") +
+    message = "Restored global.pcd" +
+              std::string(pgm_restored ? " and map.pgm"
+                                       : (pgm_removed ? " (removed generated map.pgm)" : "")) +
               " from patch/*.origin.*";
   } else {
     if (!base_map_ || base_map_->empty()) {
@@ -1464,6 +1637,7 @@ bool DynamicMapUpdater::resetToOrigin(CloudPtr& restored_map, std::string& out_y
   inflight_added_snapshot_.clear();
   inflight_removed_snapshot_.clear();
   has_last_kf_ = false;
+  last_cleanup_stamp_ = -1.0;
   dirty_since_time_ = -1.0;
 
   return true;

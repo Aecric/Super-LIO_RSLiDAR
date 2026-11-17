@@ -72,7 +72,7 @@ inline bool compute_error(
 
 SuperLIOReLoc::~SuperLIOReLoc() {
   if (map_updater_) {
-    map_updater_->flushSyncIfNeeded();
+    map_updater_->flushSyncIfNeeded(/*rebuild_reloc_targets=*/false, nullptr);
   }
 }
 
@@ -135,7 +135,11 @@ void SuperLIOReLoc::init(){
               << RESET;
     data_wrapper_->setResetMapHandler([this](std::string& msg) { return resetMapToOrigin(msg); });
     data_wrapper_->setStandbyHandler([this]() {
-      if (map_updater_) map_updater_->flushSyncIfNeeded();
+      if (!map_updater_) return;
+      DynamicMapUpdater::CommitResult commit;
+      if (map_updater_->flushSyncIfNeeded(/*rebuild_reloc_targets=*/true, &commit)) {
+        applyCommitResult(std::move(commit));
+      }
     });
   }
 

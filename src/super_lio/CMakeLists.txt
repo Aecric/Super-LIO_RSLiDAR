@@ -40,6 +40,7 @@ find_package(TBB REQUIRED)
 if(NOT TARGET kiss_matcher::kiss_matcher_core)
   set(USE_SYSTEM_TBB ON CACHE BOOL "Use system TBB for KISS-Matcher" FORCE)
   set(USE_SYSTEM_ROBIN OFF CACHE BOOL "Fetch ROBIN for KISS-Matcher" FORCE)
+  set(BUILD_TESTS OFF CACHE BOOL "Disable third-party ROBIN tests" FORCE)
   # Static KISS/ROBIN archives end up inside the shared liblio.
   set(CMAKE_POSITION_INDEPENDENT_CODE ON)
   add_subdirectory(
@@ -180,5 +181,15 @@ string(CONFIGURE [[
     "${_super_lio_strip_root}/@CMAKE_INSTALL_LIBDIR@/libpmc.a")
 ]] _super_lio_strip_code @ONLY)
 install(CODE "${_super_lio_strip_code}")
+
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest QUIET)
+  if(ament_cmake_gtest_FOUND)
+    ament_add_gtest(test_dynamic_map_updater test/test_dynamic_map_updater.cpp)
+    if(TARGET test_dynamic_map_updater)
+      target_link_libraries(test_dynamic_map_updater lio ${cpp_typesupport_target})
+    endif()
+  endif()
+endif()
 
 ament_package()

@@ -106,8 +106,11 @@ public:
   /// Non-blocking poll for a completed background commit ready for O(1) main-thread swap.
   bool pollCommitResult(CommitResult& out);
 
-  /// Synchronously persists uncommitted large changes (if threshold met) on standby / exit.
-  bool flushSyncIfNeeded();
+  /// Synchronously finishes any in-flight commit and persists uncommitted large changes
+  /// (if threshold met). When `rebuild_reloc_targets` is true and `out_result` is non-null,
+  /// populates `*out_result` with the latest unapplied CommitResult so live relocalization
+  /// targets, `/pcdmap`, and Nav2 stay synchronized (e.g. on standby).
+  bool flushSyncIfNeeded(bool rebuild_reloc_targets = false, CommitResult* out_result = nullptr);
 
   /// Restores disk global.pcd + map.pgm from `<map_dir>/patch/*.origin.*` and resets L0/L1.
   /// Outputs `restored_map` (the clean origin L0 cloud) and human-readable `message`.
@@ -202,6 +205,7 @@ private:
   bool has_last_kf_ = false;
   BASIC::SE3 last_kf_pose_;
   std::size_t kf_counter_ = 0;
+  double last_cleanup_stamp_ = -1.0;
 
   // Commit tracking & async worker state.
   std::unordered_set<FineKey, FineKeyHash> committed_added_keys_;
