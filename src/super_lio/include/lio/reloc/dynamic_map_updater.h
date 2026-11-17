@@ -70,6 +70,8 @@ public:
     std::unique_ptr<GenzRefiner> genz;
     std::unique_ptr<FcGate> fc;
     std::unique_ptr<KissGlobalMatcher> kiss;
+    /// True iff this commit rebuilt localization targets (false on occupancy-only retries).
+    bool reloc_targets_rebuilt = false;
     bool pgm_updated = false;
     /// Occupancy-map synchronization was required but failed (I/O error). The caller must
     /// keep the corresponding dirty cells unacknowledged so a later commit retries them.

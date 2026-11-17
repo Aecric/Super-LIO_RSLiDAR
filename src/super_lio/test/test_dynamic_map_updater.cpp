@@ -802,4 +802,197 @@ TEST_F(DynamicMapUpdaterTest, CoarseOccupancyMapReprojectsSurvivingObstacleShari
   EXPECT_EQ(px[(H - 1 - 0) * W + 2], 0u);
 }
 
+// Round-4 P2 #1: An occupancy-only retry must report reloc_targets_rebuilt == false so the
+// caller preserves existing relocalization targets (including KISS) instead of clearing them.
+TEST_F(DynamicMapUpdaterTest, OccupancyOnlyRetryReportsRelocTargetsNotRebuilt) {
+  TempMapDir tmp;
+  const CloudPtr base = makeRoomMap();
+  ASSERT_EQ(pcl::io::savePCDFileBinary((tmp.path() / "global.pcd").string(), *base), 0);
+
+  const int W = 20, H = 20;
+  {
+    std::ofstream yofs(tmp.path() / "map.yaml", std::ios::trunc);
+    yofs << "image: map.pgm\n"
+         << "mode: trinary\n"
+         << "resolution: 0.25\n"
+         << "origin: [0.0, 0.0, 0.0]\n"
+         << "negate: 0\n"
+         << "occupied_thresh: 0.65\n"
+         << "free_thresh: 0.25\n";
+  }
+  {
+    std::vector<uint8_t> init_px(W * H, 254);
+    std::ofstream pofs(tmp.path() / "map.pgm", std::ios::binary | std::ios::trunc);
+    pofs << "P5\n" << W << " " << H << "\n255\n";
+    pofs.write(reinterpret_cast<const char*>(init_px.data()),
+               static_cast<std::streamsize>(init_px.size()));
+  }
+
+  fs::create_directories(tmp.path() / "patch" / ".map.pgm.tmp");
+
+  RelocOptions opts = makeFastTestOptions();
+  DynamicMapUpdater updater(tmp.path().string(), "global.pcd", opts);
+  updater.setBaseMap(base);
+  DynamicMapUpdater::OctVoxMapType ivox({0.5f, 100000});
+  updater.populateIndex(ivox, {});
+
+  const V3 obs_w(2.125, 0.625, 0.50);
+  const V3 p1(0.0, 0.0, 0.0), p2(0.0, 0.3, 0.0);
+  const auto s1 = makeWorldPointScan(obs_w, p1);
+  const auto s2 = makeWorldPointScan(obs_w, p2);
+  updater.processScan(makeScanInput(1.0, p1, &s1), ivox);
+  ASSERT_TRUE(updater.processScan(makeScanInput(2.0, p2, &s2), ivox));
+
+  DynamicMapUpdater::CommitResult c1;
+  ASSERT_TRUE(updater.flushSyncIfNeeded(true, &c1));
+  EXPECT_TRUE(c1.success);
+  EXPECT_TRUE(c1.reloc_targets_rebuilt);
+  EXPECT_TRUE(c1.pgm_sync_pending);
+
+  fs::remove_all(tmp.path() / "patch" / ".map.pgm.tmp");
+  DynamicMapUpdater::CommitResult c2;
+  ASSERT_TRUE(updater.flushSyncIfNeeded(true, &c2));
+  EXPECT_TRUE(c2.success);
+  EXPECT_FALSE(c2.reloc_targets_rebuilt);
+  EXPECT_TRUE(c2.pgm_updated);
+  EXPECT_FALSE(c2.pgm_sync_pending);
+}
+
+// Round-4 P2 #2: When generating occupancy files from scratch, a failed map.yaml write must roll
+// back the newly created map.pgm so subsequent retries do not hit has_pgm != has_yaml -> kSkipped.
+TEST_F(DynamicMapUpdaterTest, RollsBackGeneratedPgmWhenYamlWriteFailsAndRetriesCleanly) {
+  TempMapDir tmp;
+  const CloudPtr base = makeRoomMap();
+  ASSERT_EQ(pcl::io::savePCDFileBinary((tmp.path() / "global.pcd").string(), *base), 0);
+
+  // Block writeMapYamlAtomic() by pre-creating patch/.map.yaml.tmp as a directory.
+  fs::create_directories(tmp.path() / "patch" / ".map.yaml.tmp");
+
+  RelocOptions opts = makeFastTestOptions();
+  DynamicMapUpdater updater(tmp.path().string(), "global.pcd", opts);
+  updater.setBaseMap(base);
+  DynamicMapUpdater::OctVoxMapType ivox({0.5f, 100000});
+  updater.populateIndex(ivox, {});
+
+  const V3 obs_w(2.125, 0.625, 0.50);
+  const V3 p1(0.0, 0.0, 0.0), p2(0.0, 0.3, 0.0);
+  const auto s1 = makeWorldPointScan(obs_w, p1);
+  const auto s2 = makeWorldPointScan(obs_w, p2);
+  updater.processScan(makeScanInput(1.0, p1, &s1), ivox);
+  ASSERT_TRUE(updater.processScan(makeScanInput(2.0, p2, &s2), ivox));
+
+  DynamicMapUpdater::CommitResult c1;
+  ASSERT_TRUE(updater.flushSyncIfNeeded(false, &c1));
+  EXPECT_TRUE(c1.success);
+  EXPECT_FALSE(c1.pgm_updated);
+  EXPECT_TRUE(c1.pgm_sync_pending);
+  EXPECT_FALSE(fs::exists(tmp.path() / "map.pgm"));
+  EXPECT_FALSE(fs::exists(tmp.path() / "map.yaml"));
+
+  // Unblock YAML write and flush with no new scans: both files must be generated cleanly.
+  fs::remove_all(tmp.path() / "patch" / ".map.yaml.tmp");
+  DynamicMapUpdater::CommitResult c2;
+  ASSERT_TRUE(updater.flushSyncIfNeeded(false, &c2));
+  EXPECT_TRUE(c2.success);
+  EXPECT_TRUE(c2.pgm_updated);
+  EXPECT_FALSE(c2.pgm_sync_pending);
+  EXPECT_TRUE(fs::exists(tmp.path() / "map.pgm"));
+  EXPECT_TRUE(fs::exists(tmp.path() / "map.yaml"));
+}
+
+TEST_F(DynamicMapUpdaterTest, StandbyOccupancyRetryPreservesBackgroundRebuildFlag) {
+  TempMapDir tmp;
+  const CloudPtr base = makeRoomMap();
+  ASSERT_EQ(pcl::io::savePCDFileBinary((tmp.path() / "global.pcd").string(), *base), 0);
+  fs::create_directories(tmp.path() / "patch" / ".map.yaml.tmp");
+
+  DynamicMapUpdater updater(tmp.path().string(), "global.pcd", makeFastTestOptions());
+  updater.setBaseMap(base);
+  DynamicMapUpdater::OctVoxMapType ivox({0.5f, 100000});
+  updater.populateIndex(ivox, {});
+  const V3 obstacle(2.125, 0.625, 0.50);
+  const V3 p1(0.0, 0.0, 0.0), p2(0.0, 0.3, 0.0);
+  const auto s1 = makeWorldPointScan(obstacle, p1);
+  const auto s2 = makeWorldPointScan(obstacle, p2);
+  updater.processScan(makeScanInput(1.0, p1, &s1), ivox);
+  ASSERT_TRUE(updater.processScan(makeScanInput(2.0, p2, &s2), ivox));
+  updater.maybeScheduleCommit(3.0, true);
+
+  // Standby consumes the background PCD result and immediately retries occupancy sync.
+  DynamicMapUpdater::CommitResult standby;
+  ASSERT_TRUE(updater.flushSyncIfNeeded(true, &standby));
+  ASSERT_TRUE(standby.success);
+  EXPECT_TRUE(standby.pgm_sync_pending);
+  EXPECT_TRUE(standby.reloc_targets_rebuilt);
+  EXPECT_NE(standby.ndt, nullptr);
+  EXPECT_NE(standby.genz, nullptr);
+  EXPECT_NE(standby.fc, nullptr);
+
+  fs::remove_all(tmp.path() / "patch" / ".map.yaml.tmp");
+  DynamicMapUpdater::CommitResult retry;
+  ASSERT_TRUE(updater.flushSyncIfNeeded(true, &retry));
+  EXPECT_TRUE(retry.success);
+  EXPECT_TRUE(retry.pgm_updated);
+  EXPECT_FALSE(retry.pgm_sync_pending);
+  EXPECT_FALSE(retry.reloc_targets_rebuilt);
+}
+
+TEST_F(DynamicMapUpdaterTest, RegeneratesInterruptedOccupancyPairFromAbsentOrigins) {
+  for (const bool leftover_pgm : {true, false}) {
+    SCOPED_TRACE(leftover_pgm ? "orphan PGM" : "orphan YAML");
+    TempMapDir tmp;
+    const CloudPtr base = makeRoomMap();
+    ASSERT_EQ(pcl::io::savePCDFileBinary((tmp.path() / "global.pcd").string(), *base), 0);
+    fs::create_directories(tmp.path() / "patch" / ".map.yaml.tmp");
+
+    DynamicMapUpdater updater(tmp.path().string(), "global.pcd", makeFastTestOptions());
+    updater.setBaseMap(base);
+    DynamicMapUpdater::OctVoxMapType ivox({0.5f, 100000});
+    updater.populateIndex(ivox, {});
+    const V3 obstacle(2.125, 0.625, 0.50);
+    const V3 p1(0.0, 0.0, 0.0), p2(0.0, 0.3, 0.0);
+    const auto s1 = makeWorldPointScan(obstacle, p1);
+    const auto s2 = makeWorldPointScan(obstacle, p2);
+    updater.processScan(makeScanInput(1.0, p1, &s1), ivox);
+    ASSERT_TRUE(updater.processScan(makeScanInput(2.0, p2, &s2), ivox));
+    DynamicMapUpdater::CommitResult first;
+    ASSERT_TRUE(updater.flushSyncIfNeeded(false, &first));
+    ASSERT_TRUE(first.success);
+    ASSERT_TRUE(first.pgm_sync_pending);
+    fs::remove_all(tmp.path() / "patch" / ".map.yaml.tmp");
+
+    // Simulate interrupted generation (or failed rollback) leaving exactly one file.
+    {
+      std::ofstream orphan(tmp.path() / (leftover_pgm ? "map.pgm" : "map.yaml"));
+      orphan << "incomplete generation\n";
+    }
+    const fs::path sentinel = tmp.path() / "patch" / "map.origin.yaml.absent";
+    fs::remove(sentinel);
+    fs::create_symlink(sentinel.filename(), sentinel);  // exists() returns ELOOP.
+    DynamicMapUpdater::CommitResult failed;
+    ASSERT_TRUE(updater.flushSyncIfNeeded(false, &failed));
+    EXPECT_TRUE(failed.success);
+    EXPECT_FALSE(failed.pgm_updated);
+    EXPECT_TRUE(failed.pgm_sync_pending);
+
+    fs::remove(sentinel);
+    { std::ofstream marker(sentinel); marker << "absent\n"; }
+    DynamicMapUpdater::CommitResult retry;
+    ASSERT_TRUE(updater.flushSyncIfNeeded(false, &retry));
+    EXPECT_TRUE(retry.success);
+    EXPECT_TRUE(retry.pgm_updated);
+    EXPECT_FALSE(retry.pgm_sync_pending);
+    ASSERT_TRUE(fs::exists(tmp.path() / "map.yaml"));
+    int width = 0, height = 0;
+    const auto pixels = readP5Pixels(tmp.path() / "map.pgm", width, height);
+    ASSERT_GT(width, 0);
+    ASSERT_GT(height, 0);
+    const int ix = static_cast<int>(std::floor((obstacle.x() + 4.0) / 0.25));
+    const int iy = static_cast<int>(std::floor((obstacle.y() + 4.0) / 0.25));
+    ASSERT_LT(ix, width);
+    ASSERT_LT(iy, height);
+    EXPECT_EQ(pixels[(height - 1 - iy) * width + ix], 0u);
+  }
+}
+
 }  // namespace

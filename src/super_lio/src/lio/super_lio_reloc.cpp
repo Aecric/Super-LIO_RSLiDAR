@@ -902,7 +902,7 @@ void SuperLIOReLoc::applyCommitResult(DynamicMapUpdater::CommitResult&& commit) 
   if (commit.ndt) ndt_ = commit.ndt;
   if (commit.genz) genz_ = std::move(commit.genz);
   if (commit.fc) fc_ = std::move(commit.fc);
-  if (data_wrapper_->relocOptions().cold_start.enable) {
+  if (commit.reloc_targets_rebuilt && data_wrapper_->relocOptions().cold_start.enable) {
     kiss_ = std::move(commit.kiss);
   }
   data_wrapper_->set_global_map(point_map_);

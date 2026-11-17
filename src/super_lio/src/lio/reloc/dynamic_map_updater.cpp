@@ -1239,6 +1239,7 @@ bool DynamicMapUpdater::flushSyncIfNeeded(bool rebuild_reloc_targets, CommitResu
     if (!res.genz && completed_bg.genz) res.genz = std::move(completed_bg.genz);
     if (!res.fc && completed_bg.fc) res.fc = std::move(completed_bg.fc);
     if (!res.kiss && completed_bg.kiss) res.kiss = std::move(completed_bg.kiss);
+    if (completed_bg.reloc_targets_rebuilt) res.reloc_targets_rebuilt = true;
   }
 
   if (!res.pgm_updated && had_bg && completed_bg.pgm_updated) {
@@ -1419,9 +1420,19 @@ DynamicMapUpdater::PgmSyncStatus DynamicMapUpdater::syncPgmMap(const CommitJob& 
   const bool has_yaml = fs::exists(yaml_path, ec);
   if (ec) return PgmSyncStatus::kFailed;
   if (has_pgm != has_yaml) {
-    LOG(WARNING) << " ---> [MapUpdate] incomplete existing occupancy map (pgm=" << has_pgm
-                 << ", yaml=" << has_yaml << "); skipping PGM sync";
-    return PgmSyncStatus::kSkipped;
+    const bool pgm_was_absent = fs::exists(patch_dir / "map.origin.pgm.absent", ec);
+    if (ec) return PgmSyncStatus::kFailed;
+    const bool yaml_was_absent = fs::exists(patch_dir / "map.origin.yaml.absent", ec);
+    if (ec) return PgmSyncStatus::kFailed;
+    const bool generated_from_absent =
+        pgm_cfg.create_if_missing && pgm_was_absent && yaml_was_absent;
+    if (!generated_from_absent) {
+      LOG(WARNING) << " ---> [MapUpdate] incomplete existing occupancy map (pgm=" << has_pgm
+                   << ", yaml=" << has_yaml << "); skipping PGM sync";
+      return PgmSyncStatus::kSkipped;
+    }
+    LOG(WARNING) << " ---> [MapUpdate] incomplete generated occupancy map (pgm=" << has_pgm
+                 << ", yaml=" << has_yaml << "); regenerating missing pair";
   }
 
   if (has_pgm && has_yaml) {
@@ -1597,6 +1608,8 @@ DynamicMapUpdater::PgmSyncStatus DynamicMapUpdater::syncPgmMap(const CommitJob& 
 
   if (!writePgmAtomic(patch_dir, pgm_path, img)) return PgmSyncStatus::kFailed;
   if (!writeMapYamlAtomic(patch_dir, yaml_path, res, origin_x, origin_y)) {
+    std::error_code rm_ec;
+    fs::remove(pgm_path, rm_ec);
     return PgmSyncStatus::kFailed;
   }
   out_yaml_path = yaml_path.string();
@@ -1646,6 +1659,7 @@ DynamicMapUpdater::CommitResult DynamicMapUpdater::executeCommitJob(const Commit
           res.kiss.reset();
         }
       }
+      res.reloc_targets_rebuilt = true;
     }
   }
 
