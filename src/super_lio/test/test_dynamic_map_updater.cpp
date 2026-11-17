@@ -456,4 +456,151 @@ TEST_F(DynamicMapUpdaterTest, StandbyFlushRebuildsTargetsAndPreservesCompletedBa
   EXPECT_NE(bg_standby_res.fc, nullptr);
 }
 
+// Round-2 P2 #1: processScan must remain paused when driverseat_collecting is true.
+TEST_F(DynamicMapUpdaterTest, DriverseatCollectingGatesDynamicMapUpdates) {
+  TempMapDir tmp;
+  const CloudPtr base = makeRoomMap();
+  RelocOptions opts = makeFastTestOptions();
+
+  DynamicMapUpdater updater(tmp.path().string(), "global.pcd", opts);
+  updater.setBaseMap(base);
+  DynamicMapUpdater::OctVoxMapType ivox({0.5f, 100000});
+  updater.populateIndex(ivox, {});
+
+  const V3 obs_world(2.1, 0.1, 0.5);
+  const V3 p1(0.0, 0.0, 0.0), p2(0.0, 0.3, 0.0);
+  const auto s1 = makeWorldPointScan(obs_world, p1);
+  const auto s2 = makeWorldPointScan(obs_world, p2);
+
+  auto in1 = makeScanInput(1.0, p1, &s1);
+  in1.driverseat_collecting = true;
+  auto in2 = makeScanInput(2.0, p2, &s2);
+  in2.driverseat_collecting = true;
+  EXPECT_FALSE(updater.processScan(in1, ivox));
+  EXPECT_FALSE(updater.processScan(in2, ivox));
+  EXPECT_EQ(updater.addedCount(), 0u);
+}
+
+// Round-2 P2 #2: Failed PGM synchronization must retain dirty cells so a subsequent commit
+// re-projects them into map.pgm instead of leaving Nav2 permanently out of sync with global.pcd.
+TEST_F(DynamicMapUpdaterTest, RetainsDirtyCellsWhenOccupancySyncFailsAndRetriesLater) {
+  TempMapDir tmp;
+  const CloudPtr base = makeRoomMap();
+  ASSERT_EQ(pcl::io::savePCDFileBinary((tmp.path() / "global.pcd").string(), *base), 0);
+
+  const int W = 20, H = 20;
+  {
+    std::ofstream yofs(tmp.path() / "map.yaml", std::ios::trunc);
+    yofs << "image: map.pgm\n"
+         << "mode: trinary\n"
+         << "resolution: 0.25\n"
+         << "origin: [0.0, 0.0, 0.0]\n"
+         << "negate: 0\n"
+         << "occupied_thresh: 0.65\n"
+         << "free_thresh: 0.25\n";
+  }
+  {
+    std::vector<uint8_t> init_px(W * H, 254);
+    std::ofstream pofs(tmp.path() / "map.pgm", std::ios::binary | std::ios::trunc);
+    pofs << "P5\n" << W << " " << H << "\n255\n";
+    pofs.write(reinterpret_cast<const char*>(init_px.data()),
+               static_cast<std::streamsize>(init_px.size()));
+  }
+
+  // Block writePgmAtomic() by placing a directory at patch/.map.pgm.tmp.
+  fs::create_directories(tmp.path() / "patch" / ".map.pgm.tmp");
+
+  RelocOptions opts = makeFastTestOptions();
+  DynamicMapUpdater updater(tmp.path().string(), "global.pcd", opts);
+  updater.setBaseMap(base);
+  DynamicMapUpdater::OctVoxMapType ivox({0.5f, 100000});
+  updater.populateIndex(ivox, {});
+
+  // Obstacle at (2.125, 0.625, 0.50) -> ix = 8, iy = 2 (row = 19 - 2 = 17).
+  const V3 obs_w(2.125, 0.625, 0.50);
+  const V3 p1(0.0, 0.0, 0.0), p2(0.0, 0.3, 0.0);
+  const auto s1 = makeWorldPointScan(obs_w, p1);
+  const auto s2 = makeWorldPointScan(obs_w, p2);
+  updater.processScan(makeScanInput(1.0, p1, &s1), ivox);
+  ASSERT_TRUE(updater.processScan(makeScanInput(2.0, p2, &s2), ivox));
+
+  DynamicMapUpdater::CommitResult commit1;
+  ASSERT_TRUE(updater.flushSyncIfNeeded(false, &commit1));
+  EXPECT_TRUE(commit1.success);
+  EXPECT_FALSE(commit1.pgm_updated);
+  EXPECT_TRUE(commit1.pgm_sync_pending);
+
+  int out_w = 0, out_h = 0;
+  std::vector<uint8_t> px1 = readP5Pixels(tmp.path() / "map.pgm", out_w, out_h);
+  EXPECT_EQ(px1[(H - 1 - 2) * W + 8], 254u);
+
+  // Clear the transient I/O obstacle and flush with NO new scans: retained dirty cells must retry.
+  fs::remove_all(tmp.path() / "patch" / ".map.pgm.tmp");
+
+  DynamicMapUpdater::CommitResult commit2;
+  ASSERT_TRUE(updater.flushSyncIfNeeded(false, &commit2));
+  EXPECT_TRUE(commit2.success);
+  EXPECT_TRUE(commit2.pgm_updated);
+  EXPECT_FALSE(commit2.pgm_sync_pending);
+
+  std::vector<uint8_t> px2 = readP5Pixels(tmp.path() / "map.pgm", out_w, out_h);
+  EXPECT_EQ(px2[(H - 1 - 2) * W + 8], 0u);
+}
+
+// Round-2 P2 #3: A base sub-voxel holding both a locked floor point and an in-band obstacle
+// point must remain protected from carving even if OctVox keeps the obstacle representative.
+TEST_F(DynamicMapUpdaterTest, MixedFloorAndObstacleBaseSubVoxelIsProtectedFromCarving) {
+  TempMapDir tmp;
+  const CloudPtr base = makeRoomMap(/*with_removable_box=*/false);
+  // Sub-voxel (12, 0, 0) spans [3.0, 3.25) x [0.0, 0.25) x [0.0, 0.25).
+  // Insert an obstacle-height point BEFORE the floor point (> 0.10 m apart) so OctVox stores
+  // z = 0.20 as the sub-voxel representative while the base cloud still has floor at z = 0.02.
+  PointType obs_low;
+  obs_low.x = 3.125f;
+  obs_low.y = 0.125f;
+  obs_low.z = 0.20f;
+  obs_low.intensity = 30.0f;
+  PointType floor_pt;
+  floor_pt.x = 3.125f;
+  floor_pt.y = 0.125f;
+  floor_pt.z = 0.02f;
+  floor_pt.intensity = 10.0f;
+  // Move the mixed obstacle point to the front of the base cloud before floor points in (12, 0, 0).
+  base->points.insert(base->points.begin(), obs_low);
+  base->points.push_back(floor_pt);
+  base->width = static_cast<uint32_t>(base->points.size());
+
+  RelocOptions opts = makeFastTestOptions();
+  opts.map_update.obs_z_min = 0.10;
+  opts.map_update.carve_confirm_misses = 2;
+  opts.map_update.carve_min_baseline = 0.30;
+  opts.map_update.carve_ray_radius = 0.08;
+
+  DynamicMapUpdater updater(tmp.path().string(), "global.pcd", opts);
+  updater.setBaseMap(base);
+  DynamicMapUpdater::OctVoxMapType ivox({0.5f, 100000});
+  updater.populateIndex(ivox, {});
+
+  // Confirm the stored representative in ivox is indeed the z=0.20 point.
+  V3 rep;
+  bool is_base = false;
+  const auto mixed_fk = ivox.toFineKey(V3(3.125, 0.125, 0.20));
+  ASSERT_TRUE(ivox.getSubVoxel(mixed_fk, rep, &is_base));
+  ASSERT_TRUE(is_base);
+  ASSERT_NEAR(rep.z(), 0.20, 0.05);
+
+  // Shoot behind-hit rays dead-center through rep across 2 keyframes with baseline 0.40 m.
+  const V3 s1_pos(0.0, 0.0, 0.20);
+  const V3 s2_pos(0.0, 0.40, 0.20);
+  const V3 far1 = s1_pos + (rep - s1_pos) * 1.85;
+  const V3 far2 = s2_pos + (rep - s2_pos) * 1.85;
+  const auto scan1 = makeWorldPointScan(far1, s1_pos);
+  const auto scan2 = makeWorldPointScan(far2, s2_pos);
+
+  EXPECT_FALSE(updater.processScan(makeScanInput(1.0, s1_pos, &scan1), ivox));
+  EXPECT_FALSE(updater.processScan(makeScanInput(2.0, s2_pos, &scan2), ivox));
+  EXPECT_EQ(updater.removedCount(), 0u);
+  EXPECT_TRUE(ivox.getSubVoxel(mixed_fk, rep, &is_base));
+}
+
 }  // namespace

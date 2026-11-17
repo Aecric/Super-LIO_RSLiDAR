@@ -364,6 +364,7 @@ void DynamicMapUpdater::setBaseMap(const CloudPtr& base_map) {
   }
 
   l0_centroids_.clear();
+  l0_protected_keys_.clear();
   if (!base_map_ || base_map_->empty()) return;
 
   struct Accum {
@@ -386,7 +387,26 @@ void DynamicMapUpdater::setBaseMap(const CloudPtr& base_map) {
   }
 
   buildGroundGrid(*base_map_);
+
+  // Lock any L0 sub-voxel that holds at least one ground / upper-wall sample. OctVox keeps a
+  // single representative per sub-voxel, so a mixed cell (floor + obstacle return within
+  // 0.25 m) can expose the obstacle centroid; carving by that representative would otherwise
+  // delete the floor samples too when the persistent map drops every base point of the key.
+  l0_protected_keys_.clear();
+  const float obs_z_min = static_cast<float>(options_.map_update.obs_z_min);
+  const float obs_z_max = static_cast<float>(options_.map_update.obs_z_max);
+  for (const auto& pt : base_map_->points) {
+    const V3 v(pt.x, pt.y, pt.z);
+    if (!v.allFinite()) continue;
+    const float h = static_cast<float>(v.z()) - estimateGroundZ(static_cast<float>(v.x()),
+                                                               static_cast<float>(v.y()));
+    if (h < obs_z_min || h > obs_z_max) {
+      l0_protected_keys_.insert((v * sub_inv_resolution_).array().floor().cast<int>());
+    }
+  }
+
   LOG(INFO) << " ---> [MapUpdate] L0 base sub-voxels=" << l0_centroids_.size()
+            << ", locked=" << l0_protected_keys_.size()
             << ", adaptive global floor z=" << ground_grid_.global_ground_z
             << " m (cells=" << ground_grid_.cells.size() << ")";
 }
@@ -879,10 +899,11 @@ bool DynamicMapUpdater::processScan(const ScanUpdateInput& input, OctVoxMapType&
 
       if (input.in_vehicle_zone && input.in_vehicle_zone(vox_pt)) continue;
 
-      // L0 Anchor Protection: ground and upper walls in L0 are permanently locked.
+      // L0 Anchor Protection: ground and upper walls in L0 are permanently locked. A mixed
+      // sub-voxel keeps its lock even when the stored representative sits in the obstacle band.
       const float h = static_cast<float>(vox_pt.z()) -
                       estimateGroundZ(static_cast<float>(vox_pt.x()), static_cast<float>(vox_pt.y()));
-      if (is_base && (h < obs_z_min || h > obs_z_max)) continue;
+      if (is_base && (l0_protected_keys_.count(fk) || h < obs_z_min || h > obs_z_max)) continue;
 
       // Require the ray to pass tightly near the actual stored sub-voxel centroid.
       const V3 rel = vox_pt - sensor_origin;
@@ -1076,18 +1097,25 @@ bool DynamicMapUpdater::pollCommitResult(CommitResult& out) {
     return false;
   }
 
-  committed_added_keys_.clear();
-  for (const auto& [fk, vox] : inflight_added_snapshot_) {
-    committed_added_keys_.insert(fk);
-  }
-  committed_removed_keys_ = inflight_removed_snapshot_;
-  inflight_added_snapshot_.clear();
-  inflight_removed_snapshot_.clear();
+  if (ready->pgm_sync_pending) {
+    // The PCD/targets are fine but the occupancy grid could not be rewritten. Keep the L1
+    // dirty cells unacknowledged so the next commit re-projects them into map.pgm.
+    LOG(WARNING) << " ---> [MapUpdate] commit gen=" << ready->generation
+                 << " could not sync occupancy map; retaining dirty cells for retry";
+  } else {
+    committed_added_keys_.clear();
+    for (const auto& [fk, vox] : inflight_added_snapshot_) {
+      committed_added_keys_.insert(fk);
+    }
+    committed_removed_keys_ = inflight_removed_snapshot_;
+    inflight_added_snapshot_.clear();
+    inflight_removed_snapshot_.clear();
 
-  std::unordered_set<FineKey, FineKeyHash> rem_occ, rem_clr;
-  computeDirtySets(rem_occ, rem_clr);
-  if (rem_occ.empty() && rem_clr.empty()) {
-    dirty_since_time_ = -1.0;
+    std::unordered_set<FineKey, FineKeyHash> rem_occ, rem_clr;
+    computeDirtySets(rem_occ, rem_clr);
+    if (rem_occ.empty() && rem_clr.empty()) {
+      dirty_since_time_ = -1.0;
+    }
   }
 
   out = std::move(*ready);
@@ -1148,10 +1176,16 @@ bool DynamicMapUpdater::flushSyncIfNeeded(bool rebuild_reloc_targets, CommitResu
     res.map_yaml_path = completed_bg.map_yaml_path;
   }
 
-  committed_added_keys_.clear();
-  for (const auto& [fk, vox] : added_voxels_) committed_added_keys_.insert(fk);
-  committed_removed_keys_ = removed_subvoxels_;
-  dirty_since_time_ = -1.0;
+  if (res.pgm_sync_pending) {
+    // Retain the dirty cells so a later flush / scheduled commit retries the occupancy sync.
+    LOG(WARNING) << " ---> [MapUpdate] synchronous flush could not sync occupancy map;"
+                 << " retaining dirty cells for retry";
+  } else {
+    committed_added_keys_.clear();
+    for (const auto& [fk, vox] : added_voxels_) committed_added_keys_.insert(fk);
+    committed_removed_keys_ = removed_subvoxels_;
+    dirty_since_time_ = -1.0;
+  }
   if (out_result) {
     *out_result = std::move(res);
   }
@@ -1289,10 +1323,11 @@ bool DynamicMapUpdater::writePcdAtomic(const std::string& map_dir,
   return replaceFileAtomic(tmp_pcd, fs::path(target_path));
 }
 
-bool DynamicMapUpdater::syncPgmMap(const CommitJob& job, const PointCloudType& updated_map,
-                                   std::string& out_yaml_path) {
+DynamicMapUpdater::PgmSyncStatus DynamicMapUpdater::syncPgmMap(const CommitJob& job,
+                                                              const PointCloudType& updated_map,
+                                                              std::string& out_yaml_path) {
   const auto& pgm_cfg = job.options.map_update.pgm;
-  if (!pgm_cfg.enable) return false;
+  if (!pgm_cfg.enable) return PgmSyncStatus::kDisabled;
 
   const fs::path dir(job.map_dir);
   const fs::path patch_dir = patchDirPath(job.map_dir);
@@ -1305,13 +1340,13 @@ bool DynamicMapUpdater::syncPgmMap(const CommitJob& job, const PointCloudType& u
 
   std::error_code ec;
   const bool has_pgm = fs::exists(pgm_path, ec);
-  if (ec) return false;
+  if (ec) return PgmSyncStatus::kFailed;
   const bool has_yaml = fs::exists(yaml_path, ec);
-  if (ec) return false;
+  if (ec) return PgmSyncStatus::kFailed;
   if (has_pgm != has_yaml) {
     LOG(WARNING) << " ---> [MapUpdate] incomplete existing occupancy map (pgm=" << has_pgm
                  << ", yaml=" << has_yaml << "); skipping PGM sync";
-    return false;
+    return PgmSyncStatus::kSkipped;
   }
 
   if (has_pgm && has_yaml) {
@@ -1319,7 +1354,7 @@ bool DynamicMapUpdater::syncPgmMap(const CommitJob& job, const PointCloudType& u
     PgmImage img;
     if (!parseMapYaml(yaml_path, meta) || !readPgmFile(pgm_path, img)) {
       LOG(WARNING) << " ---> [MapUpdate] failed to parse existing map.pgm/map.yaml; skipping PGM sync";
-      return false;
+      return PgmSyncStatus::kSkipped;
     }
 
     const uint8_t occ_val = (meta.negate == 1) ? 254 : 0;
@@ -1408,12 +1443,12 @@ bool DynamicMapUpdater::syncPgmMap(const CommitJob& job, const PointCloudType& u
       img.pixels[static_cast<std::size_t>(row) * img.width + ix] = occ_val;
     }
 
-    if (!writePgmAtomic(patch_dir, pgm_path, img)) return false;
+    if (!writePgmAtomic(patch_dir, pgm_path, img)) return PgmSyncStatus::kFailed;
     out_yaml_path = yaml_path.string();
-    return true;
+    return PgmSyncStatus::kUpdated;
   }
 
-  if (!pgm_cfg.create_if_missing || updated_map.empty()) return false;
+  if (!pgm_cfg.create_if_missing || updated_map.empty()) return PgmSyncStatus::kSkipped;
 
   // Generate fresh map.pgm + map.yaml when absent.
   const double res = std::max(0.01, pgm_cfg.resolution);
@@ -1429,14 +1464,16 @@ bool DynamicMapUpdater::syncPgmMap(const CommitJob& job, const PointCloudType& u
     min_y = std::min<double>(min_y, pt.y);
     max_y = std::max<double>(max_y, pt.y);
   }
-  if (min_x >= max_x || min_y >= max_y) return false;
+  if (min_x >= max_x || min_y >= max_y) return PgmSyncStatus::kSkipped;
 
   constexpr double kPad = 1.0;
   const double origin_x = min_x - kPad;
   const double origin_y = min_y - kPad;
   const int width = static_cast<int>(std::ceil((max_x + kPad - origin_x) * inv_res));
   const int height = static_cast<int>(std::ceil((max_y + kPad - origin_y) * inv_res));
-  if (width <= 0 || height <= 0 || width > 20000 || height > 20000) return false;
+  if (width <= 0 || height <= 0 || width > 20000 || height > 20000) {
+    return PgmSyncStatus::kSkipped;
+  }
 
   PgmImage img;
   img.width = width;
@@ -1472,10 +1509,12 @@ bool DynamicMapUpdater::syncPgmMap(const CommitJob& job, const PointCloudType& u
     img.pixels[static_cast<std::size_t>(height - 1 - iy) * width + ix] = 0;
   }
 
-  if (!writePgmAtomic(patch_dir, pgm_path, img)) return false;
-  if (!writeMapYamlAtomic(patch_dir, yaml_path, res, origin_x, origin_y)) return false;
+  if (!writePgmAtomic(patch_dir, pgm_path, img)) return PgmSyncStatus::kFailed;
+  if (!writeMapYamlAtomic(patch_dir, yaml_path, res, origin_x, origin_y)) {
+    return PgmSyncStatus::kFailed;
+  }
   out_yaml_path = yaml_path.string();
-  return true;
+  return PgmSyncStatus::kUpdated;
 }
 
 DynamicMapUpdater::CommitResult DynamicMapUpdater::executeCommitJob(const CommitJob& job) {
@@ -1522,14 +1561,17 @@ DynamicMapUpdater::CommitResult DynamicMapUpdater::executeCommitJob(const Commit
     }
   }
 
-  res.pgm_updated = syncPgmMap(job, *res.updated_map, res.map_yaml_path);
+  const PgmSyncStatus pgm_status = syncPgmMap(job, *res.updated_map, res.map_yaml_path);
+  res.pgm_updated = (pgm_status == PgmSyncStatus::kUpdated);
+  res.pgm_sync_pending = (pgm_status == PgmSyncStatus::kFailed);
   res.success = true;
 
   const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
       std::chrono::steady_clock::now() - t0).count();
   LOG(INFO) << " ---> [MapUpdate] commit gen=" << job.generation << " finished in " << ms
             << " ms (points=" << res.updated_map->size()
-            << ", pgm_updated=" << (res.pgm_updated ? "true" : "false") << ")";
+            << ", pgm_updated=" << (res.pgm_updated ? "true" : "false")
+            << ", pgm_retry=" << (res.pgm_sync_pending ? "true" : "false") << ")";
   return res;
 }
 

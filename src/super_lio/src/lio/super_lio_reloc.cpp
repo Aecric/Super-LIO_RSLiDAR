@@ -881,7 +881,7 @@ void SuperLIOReLoc::updateDynamicMap() {
     in.velocity = state.v;
     in.angular_speed = mean_omega;
     in.frame_still = frame_still_;
-    in.driverseat_collecting = layer_collecting_;
+    in.driverseat_collecting = data_wrapper_->vehicleCollecting();
     in.ds_size = ds_undistort_->size();
     in.matched = matched;
     in.base_matched = base_matched;

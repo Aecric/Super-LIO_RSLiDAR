@@ -71,6 +71,9 @@ public:
     std::unique_ptr<FcGate> fc;
     std::unique_ptr<KissGlobalMatcher> kiss;
     bool pgm_updated = false;
+    /// Occupancy-map synchronization was required but failed (I/O error). The caller must
+    /// keep the corresponding dirty cells unacknowledged so a later commit retries them.
+    bool pgm_sync_pending = false;
     std::string map_yaml_path;
     std::size_t added_voxels = 0;
     std::size_t removed_voxels = 0;
@@ -182,8 +185,13 @@ private:
   static bool ensureOriginBackup(const std::string& map_dir, const std::string& map_name);
   static bool writePcdAtomic(const std::string& map_dir, const std::string& target_path,
                              const BASIC::PointCloudType& cloud);
-  static bool syncPgmMap(const CommitJob& job, const BASIC::PointCloudType& updated_map,
-                         std::string& out_yaml_path);
+
+  /// Outcome of syncing `map.pgm`/`map.yaml` for one commit. `kFailed` means the files exist
+  /// (or were to be generated) but could not be written, so the dirty cells must be retried.
+  enum class PgmSyncStatus { kDisabled, kUpdated, kSkipped, kFailed };
+
+  static PgmSyncStatus syncPgmMap(const CommitJob& job, const BASIC::PointCloudType& updated_map,
+                                  std::string& out_yaml_path);
 
   std::string map_dir_;
   std::string map_name_;
@@ -193,6 +201,9 @@ private:
 
   BASIC::CloudPtr base_map_;
   std::unordered_map<FineKey, BASIC::V3, FineKeyHash> l0_centroids_;
+  /// L0 sub-voxels containing at least one point in the locked ground/upper-wall band.
+  /// These are never carved, even when `ivox` stores an in-band representative.
+  std::unordered_set<FineKey, FineKeyHash> l0_protected_keys_;
   GroundGrid ground_grid_;
 
   // L1 persistent patch state (mutated only on main tracking thread).
