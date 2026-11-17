@@ -603,4 +603,203 @@ TEST_F(DynamicMapUpdaterTest, MixedFloorAndObstacleBaseSubVoxelIsProtectedFromCa
   EXPECT_TRUE(ivox.getSubVoxel(mixed_fk, rep, &is_base));
 }
 
+// Round-3 P2 #1: Carving a previously persisted L1 addition after a PGM sync failure must still
+// update global.pcd, live reloc targets, and map.pgm on the next commit/flush.
+TEST_F(DynamicMapUpdaterTest, CarvingPersistedAdditionAfterPgmFailureUpdatesPcdAndOccupancy) {
+  TempMapDir tmp;
+  const CloudPtr base = makeRoomMap();
+  const fs::path pcd_path = tmp.path() / "global.pcd";
+  ASSERT_EQ(pcl::io::savePCDFileBinary(pcd_path.string(), *base), 0);
+
+  const int W = 20, H = 20;
+  {
+    std::ofstream yofs(tmp.path() / "map.yaml", std::ios::trunc);
+    yofs << "image: map.pgm\n"
+         << "mode: trinary\n"
+         << "resolution: 0.25\n"
+         << "origin: [0.0, 0.0, 0.0]\n"
+         << "negate: 0\n"
+         << "occupied_thresh: 0.65\n"
+         << "free_thresh: 0.25\n";
+  }
+  {
+    std::vector<uint8_t> init_px(W * H, 254);
+    std::ofstream pofs(tmp.path() / "map.pgm", std::ios::binary | std::ios::trunc);
+    pofs << "P5\n" << W << " " << H << "\n255\n";
+    pofs.write(reinterpret_cast<const char*>(init_px.data()),
+               static_cast<std::streamsize>(init_px.size()));
+  }
+
+  fs::create_directories(tmp.path() / "patch" / ".map.pgm.tmp");
+
+  RelocOptions opts = makeFastTestOptions();
+  DynamicMapUpdater updater(tmp.path().string(), "global.pcd", opts);
+  updater.setBaseMap(base);
+  DynamicMapUpdater::OctVoxMapType ivox({0.5f, 100000});
+  updater.populateIndex(ivox, {});
+
+  // Add obstacle at (2.125, 0.625, 0.50); commit1 persists global.pcd (+1 pt) while PGM fails.
+  const V3 obs_w(2.125, 0.625, 0.50);
+  const V3 p1(0.0, 0.0, 0.0), p2(0.0, 0.3, 0.0);
+  const auto s1 = makeWorldPointScan(obs_w, p1);
+  const auto s2 = makeWorldPointScan(obs_w, p2);
+  updater.processScan(makeScanInput(1.0, p1, &s1), ivox);
+  ASSERT_TRUE(updater.processScan(makeScanInput(2.0, p2, &s2), ivox));
+
+  DynamicMapUpdater::CommitResult c1;
+  ASSERT_TRUE(updater.flushSyncIfNeeded(true, &c1));
+  EXPECT_TRUE(c1.success);
+  EXPECT_TRUE(c1.pgm_sync_pending);
+  EXPECT_EQ(c1.updated_map->size(), base->size() + 1);
+
+  // Carve that L1 obstacle BEFORE retrying PGM.
+  const V3 cpos1(0.0, 0.625, 0.50), cpos2(0.0, 1.025, 0.50);
+  const V3 far1 = cpos1 + (obs_w - cpos1) * 2.5;
+  const V3 far2 = cpos2 + (obs_w - cpos2) * 2.5;
+  const auto cs1 = makeWorldPointScan(far1, cpos1);
+  const auto cs2 = makeWorldPointScan(far2, cpos2);
+  updater.processScan(makeScanInput(3.0, cpos1, &cs1), ivox);
+  ASSERT_TRUE(updater.processScan(makeScanInput(4.0, cpos2, &cs2), ivox));
+  ASSERT_EQ(updater.addedCount(), 0u);
+
+  // Unblock PGM and flush: departed obstacle must be removed from global.pcd AND map.pgm.
+  fs::remove_all(tmp.path() / "patch" / ".map.pgm.tmp");
+  DynamicMapUpdater::CommitResult c2;
+  ASSERT_TRUE(updater.flushSyncIfNeeded(true, &c2));
+  EXPECT_TRUE(c2.success);
+  EXPECT_TRUE(c2.pgm_updated);
+  EXPECT_FALSE(c2.pgm_sync_pending);
+  ASSERT_NE(c2.updated_map, nullptr);
+  EXPECT_EQ(c2.updated_map->size(), base->size());
+
+  CloudPtr on_disk(new PointCloudType());
+  ASSERT_EQ(pcl::io::loadPCDFile<PointType>(pcd_path.string(), *on_disk), 0);
+  EXPECT_EQ(on_disk->size(), base->size());
+
+  int out_w = 0, out_h = 0;
+  std::vector<uint8_t> px = readP5Pixels(tmp.path() / "map.pgm", out_w, out_h);
+  EXPECT_EQ(px[(H - 1 - 2) * W + 8], 254u);
+}
+
+// Round-3 P2 #2: Direct returns beyond max_add_range (inside max_carve_range) must still decay
+// previously accumulated carve misses on that obstacle.
+TEST_F(DynamicMapUpdaterTest, DirectHitBeyondAdditionRangeDecaysAccumulatedCarveEvidence) {
+  TempMapDir tmp;
+  const CloudPtr base = makeRoomMap(/*with_removable_box=*/false);
+  // Place an L0 obstacle at (5.125, 0.125, 0.625): distance > max_add_range (4.0), < max_carve_range (6.0).
+  PointType far_box;
+  far_box.x = 5.125f;
+  far_box.y = 0.125f;
+  far_box.z = 0.625f;
+  far_box.intensity = 50.0f;
+  base->points.push_back(far_box);
+  base->width = static_cast<uint32_t>(base->points.size());
+
+  RelocOptions opts = makeFastTestOptions();
+  opts.map_update.max_add_range = 4.0;
+  opts.map_update.max_carve_range = 6.0;
+  opts.map_update.carve_confirm_misses = 2;
+  opts.map_update.carve_min_baseline = 0.30;
+  opts.map_update.carve_ray_radius = 0.08;
+
+  DynamicMapUpdater updater(tmp.path().string(), "global.pcd", opts);
+  updater.setBaseMap(base);
+  DynamicMapUpdater::OctVoxMapType ivox({0.5f, 100000});
+  updater.populateIndex(ivox, {});
+
+  const V3 obs_w(5.125, 0.125, 0.625);
+  const V3 p1(0.0, 0.0, 0.625), p2(0.0, 0.20, 0.625), p3(0.0, 0.40, 0.625);
+  const auto miss1 = makeWorldPointScan(p1 + (obs_w - p1) * 1.15, p1);
+  const auto direct2 = makeWorldPointScan(obs_w, p2);
+  const auto miss3 = makeWorldPointScan(p3 + (obs_w - p3) * 1.15, p3);
+
+  // KF1 accumulates 1 miss; KF2 directly hits the obstacle at 5.125 m (> max_add_range = 4.0)
+  // and must decay the miss count back to 0; KF3 therefore only reaches count=1 (< 2).
+  EXPECT_FALSE(updater.processScan(makeScanInput(1.0, p1, &miss1), ivox));
+  EXPECT_FALSE(updater.processScan(makeScanInput(2.0, p2, &direct2), ivox));
+  EXPECT_FALSE(updater.processScan(makeScanInput(3.0, p3, &miss3), ivox));
+  EXPECT_EQ(updater.removedCount(), 0u);
+}
+
+// Round-3 P2 #3: On coarse occupancy maps (pixel > sub-voxel), clearing one obstacle must
+// reproject surviving obstacles sharing that pixel even outside the +-1 fine-grid neighborhood.
+TEST_F(DynamicMapUpdaterTest, CoarseOccupancyMapReprojectsSurvivingObstacleSharingClearedPixel) {
+  TempMapDir tmp;
+  const CloudPtr base = makeRoomMap();
+  ASSERT_EQ(pcl::io::savePCDFileBinary((tmp.path() / "global.pcd").string(), *base), 0);
+
+  const int W = 10, H = 10;
+  {
+    std::ofstream yofs(tmp.path() / "map.yaml", std::ios::trunc);
+    yofs << "image: map.pgm\n"
+         << "mode: trinary\n"
+         << "resolution: 1.0\n"
+         << "origin: [0.0, 0.0, 0.0]\n"
+         << "negate: 0\n"
+         << "occupied_thresh: 0.65\n"
+         << "free_thresh: 0.25\n";
+  }
+  {
+    std::vector<uint8_t> init_px(W * H, 254);
+    std::ofstream pofs(tmp.path() / "map.pgm", std::ios::binary | std::ios::trunc);
+    pofs << "P5\n" << W << " " << H << "\n255\n";
+    pofs.write(reinterpret_cast<const char*>(init_px.data()),
+               static_cast<std::streamsize>(init_px.size()));
+  }
+
+  RelocOptions opts = makeFastTestOptions();
+  DynamicMapUpdater updater(tmp.path().string(), "global.pcd", opts);
+  updater.setBaseMap(base);
+  DynamicMapUpdater::OctVoxMapType ivox({0.5f, 100000});
+  updater.populateIndex(ivox, {});
+
+  // Both obstacles share pixel (ix=2, iy=0) [2.0, 3.0) x [0.0, 1.0), but sit 3 sub-voxels apart:
+  // A at (2.125, 0.125, 0.50) -> fine XY (8, 0)
+  // B at (2.875, 0.875, 0.50) -> fine XY (11, 3)
+  const V3 obs_a(2.125, 0.125, 0.50);
+  const V3 obs_b(2.875, 0.875, 0.50);
+  const V3 p1(0.0, 0.0, 0.50), p2(0.0, 0.3, 0.50);
+  auto make_ab = [&](const V3& s_pos) {
+    PointCloudType sc;
+    for (const auto& pw : {obs_a, obs_b}) {
+      PointType p;
+      p.x = static_cast<float>(pw.x() - s_pos.x());
+      p.y = static_cast<float>(pw.y() - s_pos.y());
+      p.z = static_cast<float>(pw.z() - s_pos.z());
+      p.intensity = 10.0f;
+      sc.points.push_back(p);
+    }
+    sc.width = 2;
+    sc.height = 1;
+    sc.is_dense = true;
+    return sc;
+  };
+  const auto sc1 = make_ab(p1);
+  const auto sc2 = make_ab(p2);
+  updater.processScan(makeScanInput(1.0, p1, &sc1), ivox);
+  ASSERT_TRUE(updater.processScan(makeScanInput(2.0, p2, &sc2), ivox));
+
+  DynamicMapUpdater::CommitResult c1;
+  ASSERT_TRUE(updater.flushSyncIfNeeded(false, &c1));
+  ASSERT_TRUE(c1.pgm_updated);
+
+  // Carve only Obstacle A while Obstacle B remains in pixel (2, 0).
+  const V3 cpos1(0.0, 0.125, 0.50), cpos2(0.0, 0.425, 0.50);
+  const auto cs1 = makeWorldPointScan(cpos1 + (obs_a - cpos1) * 2.2, cpos1);
+  const auto cs2 = makeWorldPointScan(cpos2 + (obs_a - cpos2) * 2.2, cpos2);
+  updater.processScan(makeScanInput(3.0, cpos1, &cs1), ivox);
+  ASSERT_TRUE(updater.processScan(makeScanInput(4.0, cpos2, &cs2), ivox));
+
+  DynamicMapUpdater::CommitResult c2;
+  ASSERT_TRUE(updater.flushSyncIfNeeded(false, &c2));
+  ASSERT_TRUE(c2.pgm_updated);
+
+  int out_w = 0, out_h = 0;
+  std::vector<uint8_t> px = readP5Pixels(tmp.path() / "map.pgm", out_w, out_h);
+  ASSERT_EQ(out_w, W);
+  ASSERT_EQ(out_h, H);
+  // Pixel (ix=2, iy=0) must remain occupied (0) because Obstacle B still occupies that pixel.
+  EXPECT_EQ(px[(H - 1 - 0) * W + 2], 0u);
+}
+
 }  // namespace

@@ -713,11 +713,13 @@ bool DynamicMapUpdater::processScan(const ScanUpdateInput& input, OctVoxMapType&
     VV3 fine_samples;
   };
   std::unordered_map<FineKey, HitBucket, FineKeyHash> add_hits;
+  std::unordered_set<FineKey, FineKeyHash> direct_hit_keys;
   std::unordered_set<FineKey, FineKeyHash> protected_carve_keys;
   std::unordered_map<FineKey, V3, FineKeyHash> carve_ray_endpoints;
 
   const auto& pts = input.scan_undistort_imu->points;
   add_hits.reserve(pts.size() / 4 + 16);
+  direct_hit_keys.reserve(pts.size() / 4 + 16);
   protected_carve_keys.reserve(pts.size() / 2 + 16);
   carve_ray_endpoints.reserve(pts.size() / 4 + 16);
 
@@ -734,6 +736,7 @@ bool DynamicMapUpdater::processScan(const ScanUpdateInput& input, OctVoxMapType&
 
     if (r2 <= max_protect_r2) {
       const FineKey fk = ivox.toFineKey(p_world);
+      direct_hit_keys.insert(fk);
       protected_carve_keys.insert(fk);
       // Protect immediate sub-voxel face neighbors when a return lands near a boundary.
       for (int axis = 0; axis < 3; ++axis) {
@@ -773,17 +776,23 @@ bool DynamicMapUpdater::processScan(const ScanUpdateInput& input, OctVoxMapType&
            (input.stamp < last_stamp || (input.stamp - last_stamp) > ttl);
   };
 
-  // Step A: Direct obstacle hits -> decay carve misses & accumulate static additions.
-  for (const auto& [fk, bucket] : add_hits) {
-    // Any direct hit in this sub-voxel resets/decays pending carve evidence.
-    if (auto cit = carve_miss_.find(fk); cit != carve_miss_.end()) {
-      if (is_stale(cit->second.last_stamp)) {
-        carve_miss_.erase(cit);
-      } else {
-        cit->second.count = std::max(0, cit->second.count - 2);
-        if (cit->second.count == 0) carve_miss_.erase(cit);
+  // Decay pending carve evidence on any direct return across the full carving/protection
+  // range (including returns beyond max_add_range).
+  if (!carve_miss_.empty()) {
+    for (const auto& fk : direct_hit_keys) {
+      if (auto cit = carve_miss_.find(fk); cit != carve_miss_.end()) {
+        if (is_stale(cit->second.last_stamp)) {
+          carve_miss_.erase(cit);
+        } else {
+          cit->second.count = std::max(0, cit->second.count - 2);
+          if (cit->second.count == 0) carve_miss_.erase(cit);
+        }
       }
     }
+  }
+
+  // Step A: Direct obstacle hits within addition range -> accumulate static additions.
+  for (const auto& [fk, bucket] : add_hits) {
 
     const V3 pt = bucket.sum / static_cast<scalar>(bucket.count);
     if (input.in_vehicle_zone && input.in_vehicle_zone(pt)) continue;
@@ -1023,26 +1032,39 @@ void DynamicMapUpdater::maybeScheduleCommit(double now_sec, bool frame_still) {
     if (pending_result_) return;
   }
 
-  std::unordered_set<FineKey, FineKeyHash> newly_occupied;
-  std::unordered_set<FineKey, FineKeyHash> newly_cleared;
-  computeDirtySets(newly_occupied, newly_cleared);
-  const std::size_t total_dirty = newly_occupied.size() + newly_cleared.size();
-  if (total_dirty == 0) {
+  std::unordered_set<FineKey, FineKeyHash> pcd_occupied;
+  std::unordered_set<FineKey, FineKeyHash> pcd_cleared;
+  computeDirtySets(pcd_occupied, pcd_cleared);
+  const std::size_t total_pcd_dirty = pcd_occupied.size() + pcd_cleared.size();
+  const bool has_pgm_retry = !pgm_retry_occupied_.empty() || !pgm_retry_cleared_.empty();
+  if (total_pcd_dirty == 0 && !has_pgm_retry) {
     dirty_since_time_ = -1.0;
     return;
   }
   if (dirty_since_time_ < 0.0) dirty_since_time_ = now_sec;
 
-  const bool meets_total = static_cast<int>(total_dirty) >= cfg.min_changed_voxels;
+  const bool meets_total = static_cast<int>(total_pcd_dirty) >= cfg.min_changed_voxels;
   const bool meets_cluster =
       meets_total ||
-      static_cast<int>(computeMaxClusterSize(newly_occupied, newly_cleared)) >= cfg.min_cluster_voxels;
-  if (!meets_total && !meets_cluster) return;
+      (total_pcd_dirty > 0 &&
+       static_cast<int>(computeMaxClusterSize(pcd_occupied, pcd_cleared)) >= cfg.min_cluster_voxels);
+  if (!meets_total && !meets_cluster && !has_pgm_retry) return;
 
   if (now_sec - last_commit_time_ < cfg.commit_cooldown_sec) return;
   if (!frame_still && (now_sec - dirty_since_time_) < cfg.max_commit_defer_sec) return;
 
   joinCommitThread();
+
+  std::unordered_set<FineKey, FineKeyHash> newly_occupied = pgm_retry_occupied_;
+  std::unordered_set<FineKey, FineKeyHash> newly_cleared = pgm_retry_cleared_;
+  for (const auto& fk : pcd_occupied) {
+    newly_cleared.erase(fk);
+    newly_occupied.insert(fk);
+  }
+  for (const auto& fk : pcd_cleared) {
+    newly_occupied.erase(fk);
+    newly_cleared.insert(fk);
+  }
 
   CommitJob job;
   job.generation = ++generation_;
@@ -1054,16 +1076,20 @@ void DynamicMapUpdater::maybeScheduleCommit(double now_sec, bool frame_still) {
   job.sub_inv_resolution = sub_inv_resolution_;
   job.added_voxels = added_voxels_;
   job.removed_subvoxels = removed_subvoxels_;
-  job.newly_occupied = std::move(newly_occupied);
-  job.newly_cleared = std::move(newly_cleared);
-  job.rebuild_reloc_targets = true;
+  job.newly_occupied = newly_occupied;
+  job.newly_cleared = newly_cleared;
+  job.sync_pcd = (total_pcd_dirty > 0);
+  job.rebuild_reloc_targets = job.sync_pcd;
 
   inflight_added_snapshot_ = added_voxels_;
   inflight_removed_snapshot_ = removed_subvoxels_;
+  inflight_pgm_occupied_ = std::move(newly_occupied);
+  inflight_pgm_cleared_ = std::move(newly_cleared);
   last_commit_time_ = now_sec;
   commit_running_.store(true);
 
   LOG(INFO) << " ---> [MapUpdate] launching background commit (gen=" << job.generation
+            << ", sync_pcd=" << (job.sync_pcd ? "true" : "false")
             << ", dirty_add=" << job.newly_occupied.size()
             << ", dirty_carve=" << job.newly_cleared.size()
             << ", total_added=" << job.added_voxels.size()
@@ -1097,25 +1123,43 @@ bool DynamicMapUpdater::pollCommitResult(CommitResult& out) {
     return false;
   }
 
-  if (ready->pgm_sync_pending) {
-    // The PCD/targets are fine but the occupancy grid could not be rewritten. Keep the L1
-    // dirty cells unacknowledged so the next commit re-projects them into map.pgm.
-    LOG(WARNING) << " ---> [MapUpdate] commit gen=" << ready->generation
-                 << " could not sync occupancy map; retaining dirty cells for retry";
-  } else {
-    committed_added_keys_.clear();
-    for (const auto& [fk, vox] : inflight_added_snapshot_) {
-      committed_added_keys_.insert(fk);
-    }
-    committed_removed_keys_ = inflight_removed_snapshot_;
-    inflight_added_snapshot_.clear();
-    inflight_removed_snapshot_.clear();
+  // Always record the successfully persisted PCD/reloc snapshot independently of PGM status so
+  // subsequent additions/removals (including carving an earlier L1 addition) are never lost.
+  committed_added_keys_.clear();
+  for (const auto& [fk, vox] : inflight_added_snapshot_) {
+    committed_added_keys_.insert(fk);
+  }
+  committed_removed_keys_ = inflight_removed_snapshot_;
+  inflight_added_snapshot_.clear();
+  inflight_removed_snapshot_.clear();
 
-    std::unordered_set<FineKey, FineKeyHash> rem_occ, rem_clr;
-    computeDirtySets(rem_occ, rem_clr);
-    if (rem_occ.empty() && rem_clr.empty()) {
-      dirty_since_time_ = -1.0;
+  if (ready->pgm_sync_pending) {
+    for (const auto& fk : inflight_pgm_occupied_) {
+      if (!inflight_pgm_cleared_.count(fk)) {
+        pgm_retry_cleared_.erase(fk);
+        pgm_retry_occupied_.insert(fk);
+      }
     }
+    for (const auto& fk : inflight_pgm_cleared_) {
+      pgm_retry_occupied_.erase(fk);
+      pgm_retry_cleared_.insert(fk);
+    }
+    LOG(WARNING) << " ---> [MapUpdate] commit gen=" << ready->generation
+                 << " synced PCD but not occupancy map; retaining "
+                 << (pgm_retry_occupied_.size() + pgm_retry_cleared_.size())
+                 << " cells for PGM retry";
+  } else {
+    pgm_retry_occupied_.clear();
+    pgm_retry_cleared_.clear();
+  }
+  inflight_pgm_occupied_.clear();
+  inflight_pgm_cleared_.clear();
+
+  std::unordered_set<FineKey, FineKeyHash> rem_occ, rem_clr;
+  computeDirtySets(rem_occ, rem_clr);
+  if (rem_occ.empty() && rem_clr.empty() &&
+      pgm_retry_occupied_.empty() && pgm_retry_cleared_.empty()) {
+    dirty_since_time_ = -1.0;
   }
 
   out = std::move(*ready);
@@ -1131,20 +1175,32 @@ bool DynamicMapUpdater::flushSyncIfNeeded(bool rebuild_reloc_targets, CommitResu
   CommitResult completed_bg;
   const bool had_bg = pollCommitResult(completed_bg);
 
-  std::unordered_set<FineKey, FineKeyHash> newly_occupied;
-  std::unordered_set<FineKey, FineKeyHash> newly_cleared;
-  computeDirtySets(newly_occupied, newly_cleared);
-  const std::size_t total_dirty = newly_occupied.size() + newly_cleared.size();
-  const bool meets_total = static_cast<int>(total_dirty) >= cfg.min_changed_voxels;
+  std::unordered_set<FineKey, FineKeyHash> pcd_occupied;
+  std::unordered_set<FineKey, FineKeyHash> pcd_cleared;
+  computeDirtySets(pcd_occupied, pcd_cleared);
+  const std::size_t total_pcd_dirty = pcd_occupied.size() + pcd_cleared.size();
+  const bool has_pgm_retry = !pgm_retry_occupied_.empty() || !pgm_retry_cleared_.empty();
+  const bool meets_total = static_cast<int>(total_pcd_dirty) >= cfg.min_changed_voxels;
   const bool meets_cluster =
-      total_dirty > 0 &&
+      total_pcd_dirty > 0 &&
       (meets_total ||
-       static_cast<int>(computeMaxClusterSize(newly_occupied, newly_cleared)) >= cfg.min_cluster_voxels);
-  if (!meets_total && !meets_cluster) {
+       static_cast<int>(computeMaxClusterSize(pcd_occupied, pcd_cleared)) >= cfg.min_cluster_voxels);
+  if (!meets_total && !meets_cluster && !has_pgm_retry) {
     if (had_bg && out_result) {
       *out_result = std::move(completed_bg);
     }
     return had_bg;
+  }
+
+  std::unordered_set<FineKey, FineKeyHash> newly_occupied = pgm_retry_occupied_;
+  std::unordered_set<FineKey, FineKeyHash> newly_cleared = pgm_retry_cleared_;
+  for (const auto& fk : pcd_occupied) {
+    newly_cleared.erase(fk);
+    newly_occupied.insert(fk);
+  }
+  for (const auto& fk : pcd_cleared) {
+    newly_occupied.erase(fk);
+    newly_cleared.insert(fk);
   }
 
   CommitJob job;
@@ -1159,9 +1215,11 @@ bool DynamicMapUpdater::flushSyncIfNeeded(bool rebuild_reloc_targets, CommitResu
   job.removed_subvoxels = removed_subvoxels_;
   job.newly_occupied = std::move(newly_occupied);
   job.newly_cleared = std::move(newly_cleared);
-  job.rebuild_reloc_targets = rebuild_reloc_targets && (out_result != nullptr);
+  job.sync_pcd = (total_pcd_dirty > 0);
+  job.rebuild_reloc_targets = job.sync_pcd && rebuild_reloc_targets && (out_result != nullptr);
 
-  LOG(INFO) << " ---> [MapUpdate] synchronous flush (dirty=" << total_dirty
+  LOG(INFO) << " ---> [MapUpdate] synchronous flush (pcd_dirty=" << total_pcd_dirty
+            << ", pgm_retry=" << (has_pgm_retry ? "true" : "false")
             << ", rebuild_targets=" << (job.rebuild_reloc_targets ? "true" : "false") << ")";
   CommitResult res = executeCommitJob(job);
   if (!res.success) {
@@ -1171,20 +1229,37 @@ bool DynamicMapUpdater::flushSyncIfNeeded(bool rebuild_reloc_targets, CommitResu
     return had_bg;
   }
 
+  if (job.sync_pcd) {
+    committed_added_keys_.clear();
+    for (const auto& [fk, vox] : added_voxels_) committed_added_keys_.insert(fk);
+    committed_removed_keys_ = removed_subvoxels_;
+  } else if (had_bg) {
+    // Preserve targets rebuilt by the completed background commit on a pure PGM-retry flush.
+    if (!res.ndt && completed_bg.ndt) res.ndt = completed_bg.ndt;
+    if (!res.genz && completed_bg.genz) res.genz = std::move(completed_bg.genz);
+    if (!res.fc && completed_bg.fc) res.fc = std::move(completed_bg.fc);
+    if (!res.kiss && completed_bg.kiss) res.kiss = std::move(completed_bg.kiss);
+  }
+
   if (!res.pgm_updated && had_bg && completed_bg.pgm_updated) {
     res.pgm_updated = true;
     res.map_yaml_path = completed_bg.map_yaml_path;
   }
 
   if (res.pgm_sync_pending) {
-    // Retain the dirty cells so a later flush / scheduled commit retries the occupancy sync.
+    pgm_retry_occupied_ = job.newly_occupied;
+    pgm_retry_cleared_ = job.newly_cleared;
     LOG(WARNING) << " ---> [MapUpdate] synchronous flush could not sync occupancy map;"
-                 << " retaining dirty cells for retry";
+                 << " retaining " << (pgm_retry_occupied_.size() + pgm_retry_cleared_.size())
+                 << " cells for PGM retry";
   } else {
-    committed_added_keys_.clear();
-    for (const auto& [fk, vox] : added_voxels_) committed_added_keys_.insert(fk);
-    committed_removed_keys_ = removed_subvoxels_;
-    dirty_since_time_ = -1.0;
+    pgm_retry_occupied_.clear();
+    pgm_retry_cleared_.clear();
+    std::unordered_set<FineKey, FineKeyHash> rem_occ, rem_clr;
+    computeDirtySets(rem_occ, rem_clr);
+    if (rem_occ.empty() && rem_clr.empty()) {
+      dirty_since_time_ = -1.0;
+    }
   }
   if (out_result) {
     *out_result = std::move(res);
@@ -1369,7 +1444,12 @@ DynamicMapUpdater::PgmSyncStatus DynamicMapUpdater::syncPgmMap(const CommitJob& 
       return {cos_yaw * dx + sin_yaw * dy, -sin_yaw * dx + cos_yaw * dy};
     };
 
-    // 1. Clear pixels inside newly carved 3D obstacle footprints (preserving GIMP virtual walls elsewhere).
+    // 1. Clear pixels inside newly carved 3D obstacle footprints (preserving GIMP virtual walls elsewhere)
+    //    and record every cleared pixel index so all surviving obstacles sharing those pixels are
+    //    re-projected regardless of occupancy resolution vs. sub-voxel size.
+    std::unordered_set<std::size_t> dirty_pixels;
+    dirty_pixels.reserve(job.newly_cleared.size() * 4 + 16);
+
     for (const auto& fk : job.newly_cleared) {
       const double x0 = fk.x() * sub_res;
       const double x1 = (fk.x() + 1) * sub_res;
@@ -1400,7 +1480,9 @@ DynamicMapUpdater::PgmSyncStatus DynamicMapUpdater::syncPgmMap(const CommitJob& 
             const double wy = meta.origin_y + sin_yaw * uc + cos_yaw * vc;
             if (wx < x0 || wx > x1 || wy < y0 || wy > y1) continue;
           }
-          img.pixels[static_cast<std::size_t>(row) * img.width + ix] = free_val;
+          const std::size_t px_idx = static_cast<std::size_t>(row) * img.width + ix;
+          img.pixels[px_idx] = free_val;
+          dirty_pixels.insert(px_idx);
         }
       }
       if (rotated) {
@@ -1408,13 +1490,17 @@ DynamicMapUpdater::PgmSyncStatus DynamicMapUpdater::syncPgmMap(const CommitJob& 
         const int cix = static_cast<int>(std::floor(uc_vox * inv_res));
         const int ciy = static_cast<int>(std::floor(vc_vox * inv_res));
         if (cix >= 0 && cix < img.width && ciy >= 0 && ciy < img.height) {
-          img.pixels[static_cast<std::size_t>(img.height - 1 - ciy) * img.width + cix] = free_val;
+          const std::size_t px_idx =
+              static_cast<std::size_t>(img.height - 1 - ciy) * img.width + cix;
+          img.pixels[px_idx] = free_val;
+          dirty_pixels.insert(px_idx);
         }
       }
     }
 
     // 2. Build 2D dirty XY neighborhood around newly cleared & newly occupied sub-voxels,
-    //    then re-project all persistent obstacle points (z_min <= z - z_ground <= z_max) to occupied.
+    //    then re-project all persistent obstacle points (z_min <= z - z_ground <= z_max) falling
+    //    either in that neighborhood OR inside any cleared pixel.
     std::unordered_set<Eigen::Vector2i, Grid2DHash> dirty_xy;
     for (const auto& fk : job.newly_cleared) {
       for (int dx = -1; dx <= 1; ++dx)
@@ -1429,18 +1515,18 @@ DynamicMapUpdater::PgmSyncStatus DynamicMapUpdater::syncPgmMap(const CommitJob& 
 
     for (const auto& pt : updated_map.points) {
       if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z)) continue;
-      const Eigen::Vector2i k2(static_cast<int>(std::floor(pt.x * job.sub_inv_resolution)),
-                               static_cast<int>(std::floor(pt.y * job.sub_inv_resolution)));
-      if (!dirty_xy.count(k2)) continue;
-      const float h = pt.z - job.ground_grid.query(pt.x, pt.y);
-      if (h < z_min || h > z_max) continue;
-
       const auto [u, v] = world_to_uv(pt.x, pt.y);
       const int ix = static_cast<int>(std::floor(u * inv_res));
       const int iy = static_cast<int>(std::floor(v * inv_res));
       if (ix < 0 || ix >= img.width || iy < 0 || iy >= img.height) continue;
-      const int row = img.height - 1 - iy;
-      img.pixels[static_cast<std::size_t>(row) * img.width + ix] = occ_val;
+      const std::size_t px_idx = static_cast<std::size_t>(img.height - 1 - iy) * img.width + ix;
+      const Eigen::Vector2i k2(static_cast<int>(std::floor(pt.x * job.sub_inv_resolution)),
+                               static_cast<int>(std::floor(pt.y * job.sub_inv_resolution)));
+      if (!dirty_pixels.count(px_idx) && !dirty_xy.count(k2)) continue;
+      const float h = pt.z - job.ground_grid.query(pt.x, pt.y);
+      if (h < z_min || h > z_max) continue;
+
+      img.pixels[px_idx] = occ_val;
     }
 
     if (!writePgmAtomic(patch_dir, pgm_path, img)) return PgmSyncStatus::kFailed;
@@ -1529,34 +1615,36 @@ DynamicMapUpdater::CommitResult DynamicMapUpdater::executeCommitJob(const Commit
     return res;
   }
 
-  if (!ensureOriginBackup(job.map_dir, job.map_name)) {
-    return res;
-  }
-
-  const std::string target_pcd = (fs::path(job.map_dir) / job.map_name).string();
-  if (!writePcdAtomic(job.map_dir, target_pcd, *res.updated_map)) {
-    LOG(ERROR) << " ---> [MapUpdate] failed to atomically write updated PCD: " << target_pcd;
-    return res;
-  }
-
-  if (job.rebuild_reloc_targets) {
-    res.ndt.reset(new pcl::NormalDistributionsTransform<PointType, PointType>());
-    res.ndt->setTransformationEpsilon(1e-4);
-    res.ndt->setMaximumIterations(25);
-    res.ndt->setResolution(1.0);
-    res.ndt->setInputTarget(res.updated_map);
-
-    res.genz = std::make_unique<GenzRefiner>(job.options.genz);
-    res.fc = std::make_unique<FcGate>(job.options.fc);
-    if (!res.genz->SetTarget(res.updated_map) || !res.fc->SetTarget(res.updated_map)) {
-      LOG(ERROR) << " ---> [MapUpdate] failed to rebuild GenZ/FC targets";
+  if (job.sync_pcd) {
+    if (!ensureOriginBackup(job.map_dir, job.map_name)) {
       return res;
     }
 
-    if (job.options.cold_start.enable) {
-      res.kiss = std::make_unique<KissGlobalMatcher>(job.options.kiss);
-      if (!res.kiss->SetTarget(res.updated_map)) {
-        res.kiss.reset();
+    const std::string target_pcd = (fs::path(job.map_dir) / job.map_name).string();
+    if (!writePcdAtomic(job.map_dir, target_pcd, *res.updated_map)) {
+      LOG(ERROR) << " ---> [MapUpdate] failed to atomically write updated PCD: " << target_pcd;
+      return res;
+    }
+
+    if (job.rebuild_reloc_targets) {
+      res.ndt.reset(new pcl::NormalDistributionsTransform<PointType, PointType>());
+      res.ndt->setTransformationEpsilon(1e-4);
+      res.ndt->setMaximumIterations(25);
+      res.ndt->setResolution(1.0);
+      res.ndt->setInputTarget(res.updated_map);
+
+      res.genz = std::make_unique<GenzRefiner>(job.options.genz);
+      res.fc = std::make_unique<FcGate>(job.options.fc);
+      if (!res.genz->SetTarget(res.updated_map) || !res.fc->SetTarget(res.updated_map)) {
+        LOG(ERROR) << " ---> [MapUpdate] failed to rebuild GenZ/FC targets";
+        return res;
+      }
+
+      if (job.options.cold_start.enable) {
+        res.kiss = std::make_unique<KissGlobalMatcher>(job.options.kiss);
+        if (!res.kiss->SetTarget(res.updated_map)) {
+          res.kiss.reset();
+        }
       }
     }
   }
@@ -1678,6 +1766,10 @@ bool DynamicMapUpdater::resetToOrigin(CloudPtr& restored_map, std::string& out_y
   committed_removed_keys_.clear();
   inflight_added_snapshot_.clear();
   inflight_removed_snapshot_.clear();
+  pgm_retry_occupied_.clear();
+  pgm_retry_cleared_.clear();
+  inflight_pgm_occupied_.clear();
+  inflight_pgm_cleared_.clear();
   has_last_kf_ = false;
   last_cleanup_stamp_ = -1.0;
   dirty_since_time_ = -1.0;

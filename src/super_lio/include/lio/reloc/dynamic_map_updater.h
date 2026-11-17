@@ -169,6 +169,7 @@ private:
     std::unordered_set<FineKey, FineKeyHash> removed_subvoxels;
     std::unordered_set<FineKey, FineKeyHash> newly_occupied;
     std::unordered_set<FineKey, FineKeyHash> newly_cleared;
+    bool sync_pcd = true;
     bool rebuild_reloc_targets = true;
   };
 
@@ -223,6 +224,12 @@ private:
   std::unordered_set<FineKey, FineKeyHash> committed_removed_keys_;
   std::unordered_map<FineKey, AddedVoxel, FineKeyHash> inflight_added_snapshot_;
   std::unordered_set<FineKey, FineKeyHash> inflight_removed_snapshot_;
+  // Occupancy-map dirty cells deferred after a transient syncPgmMap() write failure.
+  // Tracked independently from committed PCD keys so PCD writes and removals never stall.
+  std::unordered_set<FineKey, FineKeyHash> pgm_retry_occupied_;
+  std::unordered_set<FineKey, FineKeyHash> pgm_retry_cleared_;
+  std::unordered_set<FineKey, FineKeyHash> inflight_pgm_occupied_;
+  std::unordered_set<FineKey, FineKeyHash> inflight_pgm_cleared_;
   double last_commit_time_ = -1e9;
   double dirty_since_time_ = -1.0;
 
