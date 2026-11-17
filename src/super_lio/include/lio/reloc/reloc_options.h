@@ -187,6 +187,62 @@ struct RelocOptions {
     double ambiguity_trans = 1.0;
     double ambiguity_rot_deg = 10.0;
   } fc;
+
+  /// Automatic scene-change map update (params map_update.*).
+  /// Three-layer architecture:
+  ///   L0: immutable base map anchors (ground and high walls locked)
+  ///   L1: persistent static additions + carved base tombstones
+  ///   L2: transient vehicle.* and driverseat points (never persisted)
+  struct MapUpdate {
+    bool enable = true;
+    // Keyframe & tracking quality gate before feeding observations to L1.
+    double kf_trans_thresh = 0.25;         // m, min translation between update keyframes
+    double kf_rot_thresh_deg = 5.0;        // deg, min rotation between update keyframes
+    double min_match_ratio = 0.45;         // matched / downsampled scan points
+    int min_matched_points = 30;           // minimum matched plane points
+    double min_base_ratio = 0.50;          // fraction of matched points supported by L0 base map
+    int min_base_matched = 20;             // minimum L0-supported matched points
+    double max_speed = 1.5;                // m/s
+    double max_angular_vel = 0.6;          // rad/s
+    bool pause_during_driverseat = true;   // freeze L1 while /driverseat_in is collecting
+    double vehicle_exclude_margin = 0.5;   // m, extra exclusion buffer around active vehicle box
+
+    // Adaptive 2D local ground Z estimation & vertical anchor protection band
+    // (heights are relative to estimated local ground Z, never assuming z = 0).
+    double ground_grid_res = 1.5;          // m, XY cell size for ground Z grid
+    double max_floor_variation = 1.5;      // m, max floor height step / range from global floor mode
+    double obs_z_min = 0.10;               // m above local ground: below this L0 is locked ground
+    double obs_z_max = 2.00;               // m above local ground: above this L0 is locked upper wall
+
+    // Range limits and multi-keyframe evidence for addition & free-space carving.
+    double min_range = 1.0;                // m from LiDAR optical center
+    double max_add_range = 8.0;            // m, max range to confirm new static objects
+    double max_carve_range = 9.0;          // m, max ray traversal distance for carving
+    int confirm_hits = 5;                  // distinct keyframes required to confirm an added sub-voxel
+    double confirm_min_age_sec = 2.0;      // s, min time span from first hit to reject moving objects
+    int carve_confirm_misses = 8;          // distinct keyframes required to carve an L0 sub-voxel
+    int carve_added_misses = 5;            // distinct keyframes required to carve an L1-added sub-voxel
+    double carve_margin = 0.35;            // m, safety margin before the distant hit point
+    double carve_ray_radius = 0.12;        // m, max point-to-ray perpendicular distance for a miss
+    double carve_min_baseline = 0.25;      // m, min sensor translation spread across carving rays
+    double pending_ttl_sec = 30.0;         // s, expire unconfirmed candidates not seen recently
+
+    // Large-update commit trigger (persists global.pcd, syncs reloc targets + map.pgm).
+    int min_changed_voxels = 40;           // total uncommitted 0.25 m sub-voxels (added + carved)
+    int min_cluster_voxels = 16;           // OR single connected dirty cluster size (~1 m^2 object)
+    double commit_cooldown_sec = 30.0;     // s, minimum interval between background commits
+    double max_commit_defer_sec = 20.0;    // s, wait up to this long for standstill before committing
+
+    // 2D occupancy grid (map.pgm + map.yaml) synchronization.
+    struct Pgm {
+      bool enable = true;
+      bool create_if_missing = true;       // generate map.pgm + map.yaml if absent on commit
+      double resolution = 0.05;            // m/px when creating a new map.pgm
+      double z_min = 0.10;                 // m above local ground: obstacle band lower bound
+      double z_max = 1.50;                 // m above local ground: obstacle band upper bound
+      std::string reload_service = "/map_server/load_map";  // empty disables Nav2 service call
+    } pgm;
+  } map_update;
 };
 
 }  // namespace LI2Sup

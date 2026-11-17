@@ -15,6 +15,9 @@
 #include <unordered_set>
 
 #include <Eigen/Core>
+#include <pcl/io/pcd_io.h>
+#include <pcl/point_cloud.h>
+#include <pcl/point_types.h>
 
 #include "tsl/robin_map.h"
 #include "HKNN_list60_gem.h"
@@ -89,7 +92,8 @@ public:
 template<typename Point>
 class OctVox{
 public:
-  OctVox(const Point& pt, uint8_t local_idx)
+  OctVox(const Point& pt, uint8_t local_idx, bool is_base = false)
+    : base_mask_(is_base ? static_cast<uint8_t>(1u << local_idx) : uint8_t{0})
   {
     counts_.fill(UNINIT_MASK);
     points_[local_idx] = pt;
@@ -98,9 +102,12 @@ public:
 
   ~OctVox() {}
 
-  void AddPoint(const Point& pt, uint8_t local_idx) {
+  void AddPoint(const Point& pt, uint8_t local_idx, bool is_base = false) {
     uint8_t& count = counts_[local_idx];
     Point& stored_point = points_[local_idx];
+    if (is_base) {
+      base_mask_ |= static_cast<uint8_t>(1u << local_idx);
+    }
     if(count == UNINIT_MASK) {
       stored_point = pt;
       count = 1;
@@ -119,7 +126,36 @@ public:
     if (counts_[local_idx] != UNINIT_MASK) return false;
     points_[local_idx] = pt;
     counts_[local_idx] = 1;
+    base_mask_ &= static_cast<uint8_t>(~(1u << local_idx));
     return true;
+  }
+
+  void SetSubVoxel(const Point& pt, uint8_t local_idx, bool is_base) {
+    points_[local_idx] = pt;
+    counts_[local_idx] = 1;
+    if (is_base) {
+      base_mask_ |= static_cast<uint8_t>(1u << local_idx);
+    } else {
+      base_mask_ &= static_cast<uint8_t>(~(1u << local_idx));
+    }
+  }
+
+  bool ClearSubVoxel(uint8_t local_idx) {
+    if (counts_[local_idx] == UNINIT_MASK) return false;
+    counts_[local_idx] = UNINIT_MASK;
+    base_mask_ &= static_cast<uint8_t>(~(1u << local_idx));
+    return true;
+  }
+
+  bool IsEmpty() const {
+    for (uint8_t c : counts_) {
+      if (c != UNINIT_MASK) return false;
+    }
+    return true;
+  }
+
+  bool isBase(uint8_t local_idx) const {
+    return (base_mask_ & static_cast<uint8_t>(1u << local_idx)) != 0;
   }
 
   bool getPoint(const uint8_t local_idx, Point& pt) const {
@@ -132,6 +168,7 @@ public:
   static constexpr uint8_t MAX_POINTS_PER_SUBVOXEL = 20;
   static constexpr double DISTANCE_THRESHOLD_SQ = 0.1 * 0.1;
 
+  uint8_t base_mask_ = 0;
   std::array<uint8_t, 8> counts_;
   std::array<Point, 8> points_;
 };
@@ -195,10 +232,23 @@ public:
   }
 
   void insert(const Points& cloud_world);
+  /// Inserts immutable base-map (L0) points and marks their sub-voxels in base_mask_.
+  void insertBase(const Points& cloud_world);
   /// Adds points to empty sub-voxels only, never evicting: the existing map stays
   /// exactly as it is. Appends the points stored to *added when given; returns
   /// the number of sub-voxels filled.
   std::size_t insertNew(const Points& cloud_world, Points* added = nullptr);
+  /// O(1) sub-voxel mutation and query helpers for dynamic map updates.
+  KEY toFineKey(const Point& pt) const {
+    return (pt * sub_inv_resolution_).array().floor().template cast<int>();
+  }
+  float subResolution() const { return sub_resolution_; }
+  bool upsertSubVoxel(const KEY& fine_key, const Point& pt, bool is_base = false);
+  bool eraseSubVoxel(const KEY& fine_key);
+  bool getSubVoxel(const KEY& fine_key, Point& pt, bool* is_base = nullptr) const;
+  /// True when the immediate 2x2x2 OctVox neighborhood around `point` is
+  /// predominantly supported by L0 base-map sub-voxels.
+  bool hasBaseSupport(const Point& point) const;
   void printInfo() const;
   void getMap(std::vector<float>&) const;
   void saveMap() const;    // TODO:
@@ -340,6 +390,101 @@ void OctVoxMap<Point, Scalar>::insert(const Points& cloud_world){
       data_.splice(data_.begin(), data_, iter->second);
     }
   }
+}
+
+template<typename Point, typename Scalar>
+void OctVoxMap<Point, Scalar>::insertBase(const Points& cloud_world) {
+  for (const auto& pt : cloud_world) {
+    KEY fine_key = (pt * sub_inv_resolution_).array().floor().template cast<int>();
+    KEY key(fine_key[0] >> 1, fine_key[1] >> 1, fine_key[2] >> 1);
+    uint8_t local_idx = static_cast<uint8_t>(((fine_key[2] & 1) << 2) | ((fine_key[1] & 1) << 1) | (fine_key[0] & 1));
+
+    auto iter = grids_.find(key);
+    if (iter == grids_.end()) {
+      data_.emplace_front(std::piecewise_construct,
+        std::forward_as_tuple(key),
+        std::forward_as_tuple(pt, local_idx, true));
+      grids_.insert(std::make_pair(key, data_.begin()));
+      if (data_.size() >= capacity_) {
+        grids_.erase(data_.back().first);
+        data_.pop_back();
+      }
+    } else {
+      iter->second->second.AddPoint(pt, local_idx, true);
+      data_.splice(data_.begin(), data_, iter->second);
+    }
+  }
+}
+
+template<typename Point, typename Scalar>
+bool OctVoxMap<Point, Scalar>::upsertSubVoxel(const KEY& fine_key, const Point& pt, bool is_base) {
+  KEY key(fine_key[0] >> 1, fine_key[1] >> 1, fine_key[2] >> 1);
+  uint8_t local_idx = static_cast<uint8_t>(((fine_key[2] & 1) << 2) | ((fine_key[1] & 1) << 1) | (fine_key[0] & 1));
+  auto iter = grids_.find(key);
+  if (iter != grids_.end()) {
+    iter->second->second.SetSubVoxel(pt, local_idx, is_base);
+    return true;
+  }
+  if (data_.size() + 1 >= capacity_) return false;
+  data_.emplace_front(std::piecewise_construct,
+    std::forward_as_tuple(key),
+    std::forward_as_tuple(pt, local_idx, is_base));
+  grids_.insert(std::make_pair(key, data_.begin()));
+  return true;
+}
+
+template<typename Point, typename Scalar>
+bool OctVoxMap<Point, Scalar>::eraseSubVoxel(const KEY& fine_key) {
+  KEY key(fine_key[0] >> 1, fine_key[1] >> 1, fine_key[2] >> 1);
+  uint8_t local_idx = static_cast<uint8_t>(((fine_key[2] & 1) << 2) | ((fine_key[1] & 1) << 1) | (fine_key[0] & 1));
+  auto iter = grids_.find(key);
+  if (iter == grids_.end()) return false;
+  DATA_ITER list_it = iter->second;
+  if (!list_it->second.ClearSubVoxel(local_idx)) return false;
+  if (list_it->second.IsEmpty()) {
+    grids_.erase(iter);
+    data_.erase(list_it);
+  }
+  return true;
+}
+
+template<typename Point, typename Scalar>
+bool OctVoxMap<Point, Scalar>::getSubVoxel(const KEY& fine_key, Point& pt, bool* is_base) const {
+  KEY key(fine_key[0] >> 1, fine_key[1] >> 1, fine_key[2] >> 1);
+  uint8_t local_idx = static_cast<uint8_t>(((fine_key[2] & 1) << 2) | ((fine_key[1] & 1) << 1) | (fine_key[0] & 1));
+  auto iter = grids_.find(key);
+  if (iter == grids_.end()) return false;
+  if (!iter->second->second.getPoint(local_idx, pt)) return false;
+  if (is_base) *is_base = iter->second->second.isBase(local_idx);
+  return true;
+}
+
+template<typename Point, typename Scalar>
+bool OctVoxMap<Point, Scalar>::hasBaseSupport(const Point& point) const {
+  const KEY fine_key = (point * sub_inv_resolution_).array().floor().template cast<int>();
+  const KEY key(fine_key[0] >> 1, fine_key[1] >> 1, fine_key[2] >> 1);
+  const int dx = fine_key[0] & 1;
+  const int dy = fine_key[1] & 1;
+  const int dz = fine_key[2] & 1;
+  const KEY mirror_axis(1 - (dx << 1), 1 - (dy << 1), 1 - (dz << 1));
+  const float max_d2 = (resolution_ * 1.15f) * (resolution_ * 1.15f);
+
+  int base_cnt = 0;
+  int other_cnt = 0;
+  Point sub_pt;
+  for (uint8_t i = 0; i < 8; ++i) {
+    const KEY n_key = key + mirror_axis.cwiseProduct(HKNN_neighbor_voxel[i]);
+    auto iter = grids_.find(n_key);
+    if (iter == grids_.end()) continue;
+    const OctVoxType& vox = iter->second->second;
+    for (uint8_t j = 0; j < 8; ++j) {
+      if (!vox.getPoint(j, sub_pt)) continue;
+      if ((sub_pt - point).squaredNorm() > max_d2) continue;
+      if (vox.isBase(j)) ++base_cnt;
+      else ++other_cnt;
+    }
+  }
+  return base_cnt >= 2 && base_cnt >= other_cnt;
 }
 
 
