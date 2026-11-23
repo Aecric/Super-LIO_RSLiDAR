@@ -65,6 +65,8 @@ public:
   struct CommitResult {
     bool success = false;
     std::uint64_t generation = 0;
+    /// True iff this commit persisted an updated `global.pcd` (false on occupancy-only retries).
+    bool pcd_synced = false;
     BASIC::CloudPtr updated_map;
     pcl::NormalDistributionsTransform<BASIC::PointType, BASIC::PointType>::Ptr ndt;
     std::unique_ptr<GenzRefiner> genz;
@@ -139,6 +141,7 @@ private:
   };
 
   struct AddedVoxel {
+    std::uint64_t revision = 0;
     BASIC::V3 centroid = BASIC::V3::Zero();
     BASIC::VV3 fine_points;  // 0.10 m surface samples (capped per 0.25 m sub-voxel)
   };
@@ -210,6 +213,7 @@ private:
   GroundGrid ground_grid_;
 
   // L1 persistent patch state (mutated only on main tracking thread).
+  std::uint64_t next_voxel_revision_ = 0;
   std::unordered_map<FineKey, AddedVoxel, FineKeyHash> added_voxels_;
   std::unordered_set<FineKey, FineKeyHash> removed_subvoxels_;
 
@@ -222,7 +226,7 @@ private:
   double last_cleanup_stamp_ = -1.0;
 
   // Commit tracking & async worker state.
-  std::unordered_set<FineKey, FineKeyHash> committed_added_keys_;
+  std::unordered_map<FineKey, AddedVoxel, FineKeyHash> committed_added_voxels_;
   std::unordered_set<FineKey, FineKeyHash> committed_removed_keys_;
   std::unordered_map<FineKey, AddedVoxel, FineKeyHash> inflight_added_snapshot_;
   std::unordered_set<FineKey, FineKeyHash> inflight_removed_snapshot_;

@@ -995,4 +995,270 @@ TEST_F(DynamicMapUpdaterTest, RegeneratesInterruptedOccupancyPairFromAbsentOrigi
   }
 }
 
+TEST_F(DynamicMapUpdaterTest, OccupancyRetryDoesNotBypassPcdThresholdsOrLeakUncommittedVoxels) {
+  TempMapDir tmp;
+  const CloudPtr base = makeRoomMap();
+  const fs::path pcd_path = tmp.path() / "global.pcd";
+  ASSERT_EQ(pcl::io::savePCDFileBinary(pcd_path.string(), *base), 0);
+
+  const int W = 20, H = 20;
+  {
+    std::ofstream yofs(tmp.path() / "map.yaml", std::ios::trunc);
+    yofs << "image: map.pgm\n"
+         << "mode: trinary\n"
+         << "resolution: 0.25\n"
+         << "origin: [0.0, 0.0, 0.0]\n"
+         << "negate: 0\n"
+         << "occupied_thresh: 0.65\n"
+         << "free_thresh: 0.25\n";
+  }
+  {
+    std::vector<uint8_t> init_px(W * H, 254);
+    std::ofstream pofs(tmp.path() / "map.pgm", std::ios::binary | std::ios::trunc);
+    pofs << "P5\n" << W << " " << H << "\n255\n";
+    pofs.write(reinterpret_cast<const char*>(init_px.data()),
+               static_cast<std::streamsize>(init_px.size()));
+  }
+
+  fs::create_directories(tmp.path() / "patch" / ".map.pgm.tmp");
+
+  RelocOptions opts = makeFastTestOptions();
+  opts.map_update.min_changed_voxels = 3;
+  opts.map_update.min_cluster_voxels = 3;
+
+  DynamicMapUpdater updater(tmp.path().string(), "global.pcd", opts);
+  updater.setBaseMap(base);
+  DynamicMapUpdater::OctVoxMapType ivox({0.5f, 100000});
+  updater.populateIndex(ivox, {});
+
+  auto make_multi = [](const std::vector<V3>& pts_w, const V3& pos) {
+    PointCloudType sc;
+    for (const auto& pw : pts_w) {
+      PointType p;
+      p.x = static_cast<float>(pw.x() - pos.x());
+      p.y = static_cast<float>(pw.y() - pos.y());
+      p.z = static_cast<float>(pw.z() - pos.z());
+      p.intensity = 10.0f;
+      sc.points.push_back(p);
+    }
+    sc.width = static_cast<uint32_t>(sc.points.size());
+    sc.height = 1;
+    sc.is_dense = true;
+    return sc;
+  };
+
+  // Add 3 voxels (>= threshold 3); Commit 1 persists PCD while PGM fails.
+  const std::vector<V3> batch1 = {
+      V3(2.125, 0.625, 0.50), V3(2.375, 0.625, 0.50), V3(2.625, 0.625, 0.50)};
+  const V3 p1(0.0, 0.0, 0.0), p2(0.0, 0.3, 0.0);
+  const auto s1 = make_multi(batch1, p1);
+  const auto s2 = make_multi(batch1, p2);
+  updater.processScan(makeScanInput(1.0, p1, &s1), ivox);
+  ASSERT_TRUE(updater.processScan(makeScanInput(2.0, p2, &s2), ivox));
+
+  DynamicMapUpdater::CommitResult c1;
+  ASSERT_TRUE(updater.flushSyncIfNeeded(true, &c1));
+  EXPECT_TRUE(c1.pcd_synced);
+  EXPECT_TRUE(c1.pgm_sync_pending);
+  EXPECT_EQ(c1.updated_map->size(), base->size() + 3);
+
+  // Add 1 isolated voxel (below threshold 3): PGM retry must NOT sync it to PCD or PGM yet.
+  const V3 extra_v(3.625, 2.625, 0.50);  // ix = 14, iy = 10
+  const V3 p3(0.0, 0.6, 0.0), p4(0.0, 0.9, 0.0);
+  const auto s3 = makeWorldPointScan(extra_v, p3);
+  const auto s4 = makeWorldPointScan(extra_v, p4);
+  updater.processScan(makeScanInput(3.0, p3, &s3), ivox);
+  ASSERT_TRUE(updater.processScan(makeScanInput(4.0, p4, &s4), ivox));
+
+  fs::remove_all(tmp.path() / "patch" / ".map.pgm.tmp");
+  DynamicMapUpdater::CommitResult c2;
+  ASSERT_TRUE(updater.flushSyncIfNeeded(true, &c2));
+  EXPECT_TRUE(c2.success);
+  EXPECT_FALSE(c2.pcd_synced);
+  EXPECT_FALSE(c2.reloc_targets_rebuilt);
+  EXPECT_TRUE(c2.pgm_updated);
+
+  CloudPtr on_disk(new PointCloudType());
+  ASSERT_EQ(pcl::io::loadPCDFile<PointType>(pcd_path.string(), *on_disk), 0);
+  EXPECT_EQ(on_disk->size(), base->size() + 3);
+
+  int out_w = 0, out_h = 0;
+  std::vector<uint8_t> px = readP5Pixels(tmp.path() / "map.pgm", out_w, out_h);
+  EXPECT_EQ(px[(H - 1 - 2) * W + 8], 0u);
+  EXPECT_EQ(px[(H - 1 - 10) * W + 14], 254u);  // Unpersisted extra_v is NOT leaked into map.pgm.
+}
+
+TEST_F(DynamicMapUpdaterTest, CarvedAndReaddedSameSubVoxelUpdatesPcdAndClearsOldFinePixels) {
+  TempMapDir tmp;
+  const CloudPtr base = makeRoomMap();
+  ASSERT_EQ(pcl::io::savePCDFileBinary((tmp.path() / "global.pcd").string(), *base), 0);
+
+  // Fine 5 cm occupancy grid: one 0.25 m sub-voxel covers a 5x5 block of pixels.
+  const int W = 80, H = 40;
+  {
+    std::ofstream yofs(tmp.path() / "map.yaml", std::ios::trunc);
+    yofs << "image: map.pgm\n"
+         << "mode: trinary\n"
+         << "resolution: 0.05\n"
+         << "origin: [0.0, 0.0, 0.0]\n"
+         << "negate: 0\n"
+         << "occupied_thresh: 0.65\n"
+         << "free_thresh: 0.25\n";
+  }
+  {
+    std::vector<uint8_t> init_px(W * H, 254);
+    std::ofstream pofs(tmp.path() / "map.pgm", std::ios::binary | std::ios::trunc);
+    pofs << "P5\n" << W << " " << H << "\n255\n";
+    pofs.write(reinterpret_cast<const char*>(init_px.data()),
+               static_cast<std::streamsize>(init_px.size()));
+  }
+
+  RelocOptions opts = makeFastTestOptions();
+  DynamicMapUpdater updater(tmp.path().string(), "global.pcd", opts);
+  updater.setBaseMap(base);
+  DynamicMapUpdater::OctVoxMapType ivox({0.5f, 100000});
+  updater.populateIndex(ivox, {});
+
+  // First obstacle in sub-voxel (8, 2, 2) at (2.025, 0.525, 0.55) -> pixel (40, 10).
+  const V3 obs1(2.025, 0.525, 0.55);
+  const V3 p1(0.0, 0.0, 0.55), p2(0.0, 0.35, 0.55);
+  const auto s1 = makeWorldPointScan(obs1, p1);
+  const auto s2 = makeWorldPointScan(obs1, p2);
+  updater.processScan(makeScanInput(1.0, p1, &s1), ivox);
+  ASSERT_TRUE(updater.processScan(makeScanInput(2.0, p2, &s2), ivox));
+
+  DynamicMapUpdater::CommitResult c1;
+  ASSERT_TRUE(updater.flushSyncIfNeeded(false, &c1));
+  ASSERT_TRUE(c1.pgm_updated);
+
+  int out_w = 0, out_h = 0;
+  auto px1 = readP5Pixels(tmp.path() / "map.pgm", out_w, out_h);
+  EXPECT_EQ(px1[(H - 1 - 10) * W + 40], 0u);
+
+  // Carve obs1, then add obs2 in the SAME sub-voxel (8, 2, 2) at (2.225, 0.725, 0.55) -> pixel (44, 14)
+  // BEFORE running Commit 2.
+  const auto cs1 = makeWorldPointScan(p1 + (obs1 - p1) * 2.2, p1);
+  const auto cs2 = makeWorldPointScan(p2 + (obs1 - p2) * 2.2, p2);
+  updater.processScan(makeScanInput(3.0, p1, &cs1), ivox);
+  ASSERT_TRUE(updater.processScan(makeScanInput(4.0, p2, &cs2), ivox));
+
+  const V3 obs2(2.225, 0.725, 0.55);
+  const auto rs1 = makeWorldPointScan(obs2, p1);
+  const auto rs2 = makeWorldPointScan(obs2, p2);
+  updater.processScan(makeScanInput(5.0, p1, &rs1), ivox);
+  ASSERT_TRUE(updater.processScan(makeScanInput(6.0, p2, &rs2), ivox));
+
+  DynamicMapUpdater::CommitResult c2;
+  ASSERT_TRUE(updater.flushSyncIfNeeded(true, &c2));
+  EXPECT_TRUE(c2.pcd_synced);
+  EXPECT_TRUE(c2.pgm_updated);
+
+  auto px2 = readP5Pixels(tmp.path() / "map.pgm", out_w, out_h);
+  EXPECT_EQ(px2[(H - 1 - 10) * W + 40], 254u);  // Stale pixel from obs1 cleared.
+  EXPECT_EQ(px2[(H - 1 - 14) * W + 44], 0u);    // New pixel from obs2 occupied.
+}
+
+TEST_F(DynamicMapUpdaterTest, RotatedOccupancyCarvingClearsCornerOverlappingPixel) {
+  TempMapDir tmp;
+  const CloudPtr base = makeRoomMap();
+  ASSERT_EQ(pcl::io::savePCDFileBinary((tmp.path() / "global.pcd").string(), *base), 0);
+
+  // 45-degree rotated grid (res = 0.20 m) around origin (2.0, 0.0).
+  // Sub-voxel (8, 0, 2) is [2.00, 2.25) x [0.00, 0.25).
+  // Corner point (2.23, 0.245) has dx = 0.23, dy = 0.245 -> u = 0.3359 (ix = 1), v = 0.0106 (iy = 0),
+  // whereas pixel (1, 0) center (uc = 0.30, vc = 0.10) maps to (wx = 2.1414, wy = 0.2828 > 0.25)!
+  const int W = 20, H = 20;
+  {
+    std::ofstream yofs(tmp.path() / "map.yaml", std::ios::trunc);
+    yofs << "image: map.pgm\n"
+         << "mode: trinary\n"
+         << "resolution: 0.20\n"
+         << "origin: [2.0, 0.0, 0.7853981633974483]\n"
+         << "negate: 0\n"
+         << "occupied_thresh: 0.65\n"
+         << "free_thresh: 0.25\n";
+  }
+  {
+    std::vector<uint8_t> init_px(W * H, 254);
+    std::ofstream pofs(tmp.path() / "map.pgm", std::ios::binary | std::ios::trunc);
+    pofs << "P5\n" << W << " " << H << "\n255\n";
+    pofs.write(reinterpret_cast<const char*>(init_px.data()),
+               static_cast<std::streamsize>(init_px.size()));
+  }
+
+  RelocOptions opts = makeFastTestOptions();
+  DynamicMapUpdater updater(tmp.path().string(), "global.pcd", opts);
+  updater.setBaseMap(base);
+  DynamicMapUpdater::OctVoxMapType ivox({0.5f, 100000});
+  updater.populateIndex(ivox, {});
+
+  const V3 obs_corner(2.23, 0.245, 0.50);
+  const V3 p1(0.0, -0.16, 0.50), p2(0.0, 0.24, 0.50);
+  const auto s1 = makeWorldPointScan(obs_corner, p1);
+  const auto s2 = makeWorldPointScan(obs_corner, p2);
+  updater.processScan(makeScanInput(1.0, p1, &s1), ivox);
+  ASSERT_TRUE(updater.processScan(makeScanInput(2.0, p2, &s2), ivox));
+
+  DynamicMapUpdater::CommitResult c1;
+  ASSERT_TRUE(updater.flushSyncIfNeeded(false, &c1));
+  ASSERT_TRUE(c1.pgm_updated);
+
+  int out_w = 0, out_h = 0;
+  auto px1 = readP5Pixels(tmp.path() / "map.pgm", out_w, out_h);
+  EXPECT_EQ(px1[(H - 1 - 0) * W + 1], 0u);
+
+  const auto cs1 = makeWorldPointScan(p1 + (obs_corner - p1) * 2.2, p1);
+  const auto cs2 = makeWorldPointScan(p2 + (obs_corner - p2) * 2.2, p2);
+  updater.processScan(makeScanInput(3.0, p1, &cs1), ivox);
+  ASSERT_TRUE(updater.processScan(makeScanInput(4.0, p2, &cs2), ivox));
+
+  DynamicMapUpdater::CommitResult c2;
+  ASSERT_TRUE(updater.flushSyncIfNeeded(false, &c2));
+  ASSERT_TRUE(c2.pgm_updated);
+
+  auto px2 = readP5Pixels(tmp.path() / "map.pgm", out_w, out_h);
+  EXPECT_EQ(px2[(H - 1 - 0) * W + 1], 254u);
+}
+
+TEST_F(DynamicMapUpdaterTest, ResetToOriginFailsSafeOnBackupInspectionErrorAndPreservesLiveFiles) {
+  TempMapDir tmp;
+  const CloudPtr base = makeRoomMap();
+  ASSERT_EQ(pcl::io::savePCDFileBinary((tmp.path() / "global.pcd").string(), *base), 0);
+  {
+    std::ofstream yofs(tmp.path() / "map.yaml", std::ios::trunc);
+    yofs << "image: map.pgm\nresolution: 0.25\norigin: [0.0, 0.0, 0.0]\nnegate: 0\n";
+    std::vector<uint8_t> init_px(16, 254);
+    std::ofstream pofs(tmp.path() / "map.pgm", std::ios::binary | std::ios::trunc);
+    pofs << "P5\n4 4\n255\n";
+    pofs.write(reinterpret_cast<const char*>(init_px.data()), 16);
+  }
+
+  DynamicMapUpdater updater(tmp.path().string(), "global.pcd", makeFastTestOptions());
+  updater.setBaseMap(base);
+  DynamicMapUpdater::OctVoxMapType ivox({0.5f, 100000});
+  updater.populateIndex(ivox, {});
+
+  const V3 obs(2.125, 0.625, 0.50);
+  const V3 p1(0.0, 0.0, 0.0), p2(0.0, 0.3, 0.0);
+  const auto s1 = makeWorldPointScan(obs, p1);
+  const auto s2 = makeWorldPointScan(obs, p2);
+  updater.processScan(makeScanInput(1.0, p1, &s1), ivox);
+  ASSERT_TRUE(updater.processScan(makeScanInput(2.0, p2, &s2), ivox));
+  ASSERT_TRUE(updater.flushSyncIfNeeded(false, nullptr));
+
+  // Replace map.origin.pgm with a self-referential symlink (ELOOP): resetToOrigin must fail
+  // safely rather than treating exists()==false as "origin absent" and deleting live map.pgm.
+  const fs::path orig_pgm = tmp.path() / "patch" / "map.origin.pgm";
+  fs::remove(orig_pgm);
+  fs::create_symlink(orig_pgm.filename(), orig_pgm);
+
+  CloudPtr restored;
+  std::string yaml_path;
+  bool pgm_restored = false;
+  std::string msg;
+  EXPECT_FALSE(updater.resetToOrigin(restored, yaml_path, pgm_restored, msg));
+  EXPECT_TRUE(fs::exists(tmp.path() / "map.pgm"));
+  EXPECT_EQ(updater.addedCount(), 1u);
+}
+
 }  // namespace

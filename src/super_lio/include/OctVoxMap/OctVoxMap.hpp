@@ -107,6 +107,8 @@ public:
     Point& stored_point = points_[local_idx];
     if (is_base) {
       base_mask_ |= static_cast<uint8_t>(1u << local_idx);
+    } else if (count == UNINIT_MASK) {
+      base_mask_ &= static_cast<uint8_t>(~(1u << local_idx));
     }
     if(count == UNINIT_MASK) {
       stored_point = pt;

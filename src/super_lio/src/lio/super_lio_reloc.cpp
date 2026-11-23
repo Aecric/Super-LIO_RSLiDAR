@@ -802,7 +802,7 @@ void SuperLIOReLoc::setVehicle(VV3 points, scalar yaw) {
     region_hi_ = region_hi_.cwiseMax(box);
   }
   // Doors swing out sideways and stand taller than the modeled band.
-  const scalar margin = data_wrapper_->relocOptions().vehicle.update.margin;
+  const scalar margin = std::max<scalar>(0, data_wrapper_->relocOptions().vehicle.update.margin);
   region_lo_ -= V3(margin, margin, 0.1);
   region_hi_ += V3(margin, margin, 0.5);
   if (map_updater_) {
@@ -897,21 +897,30 @@ void SuperLIOReLoc::updateDynamicMap() {
 }
 
 void SuperLIOReLoc::applyCommitResult(DynamicMapUpdater::CommitResult&& commit) {
-  if (!commit.success || !commit.updated_map) return;
-  point_map_ = commit.updated_map;
-  if (commit.ndt) ndt_ = commit.ndt;
-  if (commit.genz) genz_ = std::move(commit.genz);
-  if (commit.fc) fc_ = std::move(commit.fc);
-  if (commit.reloc_targets_rebuilt && data_wrapper_->relocOptions().cold_start.enable) {
-    kiss_ = std::move(commit.kiss);
+  if (!commit.success) return;
+  if (commit.pcd_synced && commit.updated_map) {
+    point_map_ = commit.updated_map;
+    data_wrapper_->set_global_map(point_map_);
   }
-  data_wrapper_->set_global_map(point_map_);
+  if (commit.reloc_targets_rebuilt) {
+    if (commit.ndt) ndt_ = commit.ndt;
+    if (commit.genz) genz_ = std::move(commit.genz);
+    if (commit.fc) fc_ = std::move(commit.fc);
+    if (data_wrapper_->relocOptions().cold_start.enable) {
+      kiss_ = std::move(commit.kiss);
+    }
+  }
   if (commit.pgm_updated && !commit.map_yaml_path.empty()) {
     data_wrapper_->notifyNav2MapReload(commit.map_yaml_path);
   }
-  LOG(INFO) << GREEN << " ---> [MapUpdate] swapped persisted map & reloc targets (gen="
-            << commit.generation << ", points=" << point_map_->size()
-            << ", +L1=" << commit.added_voxels << ", -L1=" << commit.removed_voxels << ")" << RESET;
+  if (commit.pcd_synced) {
+    LOG(INFO) << GREEN << " ---> [MapUpdate] swapped persisted map & reloc targets (gen="
+              << commit.generation << ", points=" << (point_map_ ? point_map_->size() : 0)
+              << ", +L1=" << commit.added_voxels << ", -L1=" << commit.removed_voxels << ")" << RESET;
+  } else if (commit.pgm_updated) {
+    LOG(INFO) << GREEN << " ---> [MapUpdate] completed deferred occupancy sync (gen="
+              << commit.generation << ")" << RESET;
+  }
 }
 
 bool SuperLIOReLoc::resetMapToOrigin(std::string& message) {
@@ -923,25 +932,30 @@ bool SuperLIOReLoc::resetMapToOrigin(std::string& message) {
   std::string yaml_path;
   bool pgm_restored = false;
   if (!map_updater_->resetToOrigin(restored_map, yaml_path, pgm_restored, message)) {
+    data_wrapper_->resetInputWatchdog();
     return false;
   }
+
+  const auto& options = data_wrapper_->relocOptions();
+  auto new_ndt = pcl::NormalDistributionsTransform<PointType, PointType>::Ptr(
+      new pcl::NormalDistributionsTransform<PointType, PointType>());
+  new_ndt->setTransformationEpsilon(1e-4);
+  new_ndt->setMaximumIterations(25);
+  new_ndt->setResolution(1.0);
+  new_ndt->setInputTarget(restored_map);
+
+  auto new_genz = std::make_unique<GenzRefiner>(options.genz);
+  auto new_fc = std::make_unique<FcGate>(options.fc);
+  const bool targets_ok = new_genz->SetTarget(restored_map) && new_fc->SetTarget(restored_map);
 
   point_map_ = restored_map;
   rebuildFixedIndex(vehicle_points_);
   if (!layer_cloud_.empty()) {
-    ivox_->insert(layer_cloud_);
+    ivox_->insertNew(layer_cloud_);
   }
 
-  const auto& options = data_wrapper_->relocOptions();
-  ndt_.reset(new pcl::NormalDistributionsTransform<PointType, PointType>());
-  ndt_->setTransformationEpsilon(1e-4);
-  ndt_->setMaximumIterations(25);
-  ndt_->setResolution(1.0);
-  ndt_->setInputTarget(point_map_);
-
-  auto new_genz = std::make_unique<GenzRefiner>(options.genz);
-  auto new_fc = std::make_unique<FcGate>(options.fc);
-  if (new_genz->SetTarget(point_map_) && new_fc->SetTarget(point_map_)) {
+  ndt_ = std::move(new_ndt);
+  if (targets_ok) {
     genz_ = std::move(new_genz);
     fc_ = std::move(new_fc);
   }
@@ -955,6 +969,11 @@ bool SuperLIOReLoc::resetMapToOrigin(std::string& message) {
   data_wrapper_->pubMapPatch(map_updater_->buildPatchDebugCloud());
   if (pgm_restored && !yaml_path.empty()) {
     data_wrapper_->notifyNav2MapReload(yaml_path);
+  }
+  data_wrapper_->resetInputWatchdog();
+  if (!targets_ok) {
+    message += " (warning: failed to rebuild GenZ/FC targets)";
+    return false;
   }
   LOG(INFO) << GREEN << " ---> [MapUpdate] reset_map_to_origin succeeded: " << message << RESET;
   return true;

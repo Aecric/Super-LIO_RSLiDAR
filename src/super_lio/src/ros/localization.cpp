@@ -173,6 +173,7 @@ void ROSWrapper::setupLocalization() {
        m.confirm_hits >= 1 && m.confirm_min_age_sec >= 0 &&
        m.carve_confirm_misses >= 1 && m.carve_added_misses >= 1 &&
        m.carve_margin > 0 && m.carve_ray_radius > 0 && m.carve_min_baseline >= 0 &&
+       m.pending_ttl_sec >= 0 &&
        m.min_changed_voxels >= 1 && m.min_cluster_voxels >= 1 &&
        m.commit_cooldown_sec >= 0 && m.max_commit_defer_sec >= 0 &&
        (!m.pgm.enable || (m.pgm.resolution > 0 && m.pgm.z_min < m.pgm.z_max)));

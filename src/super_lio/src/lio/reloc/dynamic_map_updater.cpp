@@ -103,6 +103,8 @@ std::string trimString(const std::string& s) {
   return s.substr(b, e - b + 1);
 }
 
+enum class FileLoadStatus { kOk, kIoError, kFormatError };
+
 struct MapYamlMeta {
   double resolution = 0.05;
   double origin_x = 0.0;
@@ -112,9 +114,9 @@ struct MapYamlMeta {
   bool valid = false;
 };
 
-bool parseMapYaml(const fs::path& yaml_path, MapYamlMeta& meta) {
+FileLoadStatus parseMapYaml(const fs::path& yaml_path, MapYamlMeta& meta) {
   std::ifstream ifs(yaml_path);
-  if (!ifs.is_open()) return false;
+  if (!ifs.is_open()) return FileLoadStatus::kIoError;
 
   bool has_res = false;
   bool in_origin_list = false;
@@ -133,7 +135,7 @@ bool parseMapYaml(const fs::path& yaml_path, MapYamlMeta& meta) {
         try {
           origin_vals.push_back(std::stod(num_str));
         } catch (...) {
-          return false;
+          return FileLoadStatus::kFormatError;
         }
         if (origin_vals.size() >= 3) in_origin_list = false;
         continue;
@@ -151,7 +153,7 @@ bool parseMapYaml(const fs::path& yaml_path, MapYamlMeta& meta) {
         meta.resolution = std::stod(val);
         has_res = meta.resolution > 1e-6;
       } catch (...) {
-        return false;
+        return FileLoadStatus::kFormatError;
       }
     } else if (key == "negate") {
       try {
@@ -173,7 +175,7 @@ bool parseMapYaml(const fs::path& yaml_path, MapYamlMeta& meta) {
             try {
               origin_vals.push_back(std::stod(t));
             } catch (...) {
-              return false;
+              return FileLoadStatus::kFormatError;
             }
           }
         }
@@ -181,15 +183,18 @@ bool parseMapYaml(const fs::path& yaml_path, MapYamlMeta& meta) {
     }
   }
 
-  if (!has_res || !std::isfinite(meta.resolution) || origin_vals.size() < 2) return false;
+  if (ifs.bad()) return FileLoadStatus::kIoError;
+  if (!has_res || !std::isfinite(meta.resolution) || origin_vals.size() < 2) {
+    return FileLoadStatus::kFormatError;
+  }
   meta.origin_x = origin_vals[0];
   meta.origin_y = origin_vals[1];
   meta.origin_yaw = origin_vals.size() >= 3 ? origin_vals[2] : 0.0;
   if (!std::isfinite(meta.origin_x) || !std::isfinite(meta.origin_y) || !std::isfinite(meta.origin_yaw)) {
-    return false;
+    return FileLoadStatus::kFormatError;
   }
   meta.valid = true;
-  return true;
+  return FileLoadStatus::kOk;
 }
 
 bool readNextPgmToken(std::istream& is, std::string& token) {
@@ -221,14 +226,14 @@ struct PgmImage {
   std::vector<uint8_t> pixels;
 };
 
-bool readPgmFile(const fs::path& pgm_path, PgmImage& img) {
+FileLoadStatus readPgmFile(const fs::path& pgm_path, PgmImage& img) {
   std::ifstream ifs(pgm_path, std::ios::binary);
-  if (!ifs.is_open()) return false;
+  if (!ifs.is_open()) return FileLoadStatus::kIoError;
 
   std::string magic, w_str, h_str, max_str;
   if (!readNextPgmToken(ifs, magic) || !readNextPgmToken(ifs, w_str) ||
       !readNextPgmToken(ifs, h_str) || !readNextPgmToken(ifs, max_str)) {
-    return false;
+    return ifs.bad() ? FileLoadStatus::kIoError : FileLoadStatus::kFormatError;
   }
   int w = 0, h = 0, maxval = 0;
   try {
@@ -236,9 +241,9 @@ bool readPgmFile(const fs::path& pgm_path, PgmImage& img) {
     h = std::stoi(h_str);
     maxval = std::stoi(max_str);
   } catch (...) {
-    return false;
+    return FileLoadStatus::kFormatError;
   }
-  if (w <= 0 || h <= 0 || maxval <= 0 || maxval > 255) return false;
+  if (w <= 0 || h <= 0 || maxval <= 0 || maxval > 255) return FileLoadStatus::kFormatError;
 
   const std::size_t total = static_cast<std::size_t>(w) * static_cast<std::size_t>(h);
   img.width = w;
@@ -248,19 +253,29 @@ bool readPgmFile(const fs::path& pgm_path, PgmImage& img) {
   if (magic == "P5") {
     // Exactly one whitespace byte separates maxval from raw binary raster.
     char sep = 0;
-    if (!ifs.get(sep)) return false;
+    if (!ifs.get(sep)) {
+      return ifs.bad() ? FileLoadStatus::kIoError : FileLoadStatus::kFormatError;
+    }
     ifs.read(reinterpret_cast<char*>(img.pixels.data()), static_cast<std::streamsize>(total));
-    return static_cast<std::size_t>(ifs.gcount()) == total;
+    if (ifs.bad()) return FileLoadStatus::kIoError;
+    return static_cast<std::size_t>(ifs.gcount()) == total ? FileLoadStatus::kOk
+                                                           : FileLoadStatus::kFormatError;
   }
   if (magic == "P2") {
     std::string tok;
     for (std::size_t i = 0; i < total; ++i) {
-      if (!readNextPgmToken(ifs, tok)) return false;
-      img.pixels[i] = static_cast<uint8_t>(std::clamp(std::stoi(tok), 0, 255));
+      if (!readNextPgmToken(ifs, tok)) {
+        return ifs.bad() ? FileLoadStatus::kIoError : FileLoadStatus::kFormatError;
+      }
+      try {
+        img.pixels[i] = static_cast<uint8_t>(std::clamp(std::stoi(tok), 0, 255));
+      } catch (...) {
+        return FileLoadStatus::kFormatError;
+      }
     }
-    return true;
+    return ifs.bad() ? FileLoadStatus::kIoError : FileLoadStatus::kOk;
   }
-  return false;
+  return FileLoadStatus::kFormatError;
 }
 
 bool writePgmAtomic(const fs::path& tmp_dir, const fs::path& dst_path, const PgmImage& img) {
@@ -602,7 +617,7 @@ void DynamicMapUpdater::populateIndex(OctVoxMapType& ivox, const VV3& transient_
   }
 
   if (!transient_extra.empty()) {
-    ivox.insert(transient_extra);
+    ivox.insertNew(transient_extra);
   }
 }
 
@@ -755,11 +770,13 @@ bool DynamicMapUpdater::processScan(const ScanUpdateInput& input, OctVoxMapType&
     }
 
     if (r2 >= min_r2 && r2 <= max_add_r2) {
-      const FineKey fk = ivox.toFineKey(p_world);
-      auto& bucket = add_hits[fk];
-      bucket.sum += p_world;
-      bucket.count += 1;
-      mergeFineSample(bucket.fine_samples, p_world);
+      if (!input.in_vehicle_zone || !input.in_vehicle_zone(p_world)) {
+        const FineKey fk = ivox.toFineKey(p_world);
+        auto& bucket = add_hits[fk];
+        bucket.sum += p_world;
+        bucket.count += 1;
+        mergeFineSample(bucket.fine_samples, p_world);
+      }
     }
 
     if (r2 >= min_carve_hit_r2) {
@@ -838,8 +855,13 @@ bool DynamicMapUpdater::processScan(const ScanUpdateInput& input, OctVoxMapType&
     const double age = input.stamp - cand.first_stamp;
     if (cand.hits >= cfg.confirm_hits && age >= cfg.confirm_min_age_sec &&
         cand.misses * 2 <= cand.hits) {
+      if (input.in_vehicle_zone && input.in_vehicle_zone(cand.mean_pt)) {
+        pending_add_.erase(pit);
+        continue;
+      }
       if (ivox.upsertSubVoxel(fk, cand.mean_pt, /*is_base=*/false)) {
         AddedVoxel av;
+        av.revision = ++next_voxel_revision_;
         av.centroid = cand.mean_pt;
         av.fine_points = std::move(cand.fine_points);
         if (av.fine_points.empty()) av.fine_points.push_back(av.centroid);
@@ -970,16 +992,21 @@ void DynamicMapUpdater::computeDirtySets(
   newly_cleared.clear();
 
   for (const auto& [fk, vox] : added_voxels_) {
-    if (!committed_added_keys_.count(fk)) {
+    auto cit = committed_added_voxels_.find(fk);
+    if (cit == committed_added_voxels_.end()) {
+      newly_occupied.insert(fk);
+    } else if (cit->second.revision != vox.revision) {
+      // Carved after an earlier commit and re-populated with new obstacle samples.
+      newly_cleared.insert(fk);
       newly_occupied.insert(fk);
     }
   }
   for (const auto& fk : removed_subvoxels_) {
-    if (!committed_removed_keys_.count(fk) && !added_voxels_.count(fk)) {
+    if (!committed_removed_keys_.count(fk)) {
       newly_cleared.insert(fk);
     }
   }
-  for (const auto& fk : committed_added_keys_) {
+  for (const auto& [fk, vox] : committed_added_voxels_) {
     if (!added_voxels_.count(fk)) {
       newly_cleared.insert(fk);
     }
@@ -1035,7 +1062,9 @@ void DynamicMapUpdater::maybeScheduleCommit(double now_sec, bool frame_still) {
   std::unordered_set<FineKey, FineKeyHash> pcd_occupied;
   std::unordered_set<FineKey, FineKeyHash> pcd_cleared;
   computeDirtySets(pcd_occupied, pcd_cleared);
-  const std::size_t total_pcd_dirty = pcd_occupied.size() + pcd_cleared.size();
+  std::unordered_set<FineKey, FineKeyHash> pcd_dirty_union = pcd_occupied;
+  pcd_dirty_union.insert(pcd_cleared.begin(), pcd_cleared.end());
+  const std::size_t total_pcd_dirty = pcd_dirty_union.size();
   const bool has_pgm_retry = !pgm_retry_occupied_.empty() || !pgm_retry_cleared_.empty();
   if (total_pcd_dirty == 0 && !has_pgm_retry) {
     dirty_since_time_ = -1.0;
@@ -1048,7 +1077,8 @@ void DynamicMapUpdater::maybeScheduleCommit(double now_sec, bool frame_still) {
       meets_total ||
       (total_pcd_dirty > 0 &&
        static_cast<int>(computeMaxClusterSize(pcd_occupied, pcd_cleared)) >= cfg.min_cluster_voxels);
-  if (!meets_total && !meets_cluster && !has_pgm_retry) return;
+  const bool sync_pcd_now = meets_total || meets_cluster;
+  if (!sync_pcd_now && !has_pgm_retry) return;
 
   if (now_sec - last_commit_time_ < cfg.commit_cooldown_sec) return;
   if (!frame_still && (now_sec - dirty_since_time_) < cfg.max_commit_defer_sec) return;
@@ -1057,13 +1087,16 @@ void DynamicMapUpdater::maybeScheduleCommit(double now_sec, bool frame_still) {
 
   std::unordered_set<FineKey, FineKeyHash> newly_occupied = pgm_retry_occupied_;
   std::unordered_set<FineKey, FineKeyHash> newly_cleared = pgm_retry_cleared_;
-  for (const auto& fk : pcd_occupied) {
-    newly_cleared.erase(fk);
-    newly_occupied.insert(fk);
-  }
-  for (const auto& fk : pcd_cleared) {
-    newly_occupied.erase(fk);
-    newly_cleared.insert(fk);
+  if (sync_pcd_now) {
+    for (const auto& fk : pcd_cleared) {
+      if (!pcd_occupied.count(fk)) {
+        newly_occupied.erase(fk);
+      }
+      newly_cleared.insert(fk);
+    }
+    for (const auto& fk : pcd_occupied) {
+      newly_occupied.insert(fk);
+    }
   }
 
   CommitJob job;
@@ -1074,15 +1107,17 @@ void DynamicMapUpdater::maybeScheduleCommit(double now_sec, bool frame_still) {
   job.base_map = base_map_;
   job.ground_grid = ground_grid_;
   job.sub_inv_resolution = sub_inv_resolution_;
-  job.added_voxels = added_voxels_;
-  job.removed_subvoxels = removed_subvoxels_;
+  job.added_voxels = sync_pcd_now ? added_voxels_ : committed_added_voxels_;
+  job.removed_subvoxels = sync_pcd_now ? removed_subvoxels_ : committed_removed_keys_;
   job.newly_occupied = newly_occupied;
   job.newly_cleared = newly_cleared;
-  job.sync_pcd = (total_pcd_dirty > 0);
-  job.rebuild_reloc_targets = job.sync_pcd;
+  job.sync_pcd = sync_pcd_now;
+  job.rebuild_reloc_targets = sync_pcd_now;
 
-  inflight_added_snapshot_ = added_voxels_;
-  inflight_removed_snapshot_ = removed_subvoxels_;
+  if (sync_pcd_now) {
+    inflight_added_snapshot_ = added_voxels_;
+    inflight_removed_snapshot_ = removed_subvoxels_;
+  }
   inflight_pgm_occupied_ = std::move(newly_occupied);
   inflight_pgm_cleared_ = std::move(newly_cleared);
   last_commit_time_ = now_sec;
@@ -1123,29 +1158,26 @@ bool DynamicMapUpdater::pollCommitResult(CommitResult& out) {
     return false;
   }
 
-  // Always record the successfully persisted PCD/reloc snapshot independently of PGM status so
-  // subsequent additions/removals (including carving an earlier L1 addition) are never lost.
-  committed_added_keys_.clear();
-  for (const auto& [fk, vox] : inflight_added_snapshot_) {
-    committed_added_keys_.insert(fk);
+  // Record the persisted PCD snapshot whenever global.pcd was synced, independently of PGM status.
+  if (ready->pcd_synced) {
+    committed_added_voxels_ = std::move(inflight_added_snapshot_);
+    committed_removed_keys_ = std::move(inflight_removed_snapshot_);
   }
-  committed_removed_keys_ = inflight_removed_snapshot_;
   inflight_added_snapshot_.clear();
   inflight_removed_snapshot_.clear();
 
   if (ready->pgm_sync_pending) {
-    for (const auto& fk : inflight_pgm_occupied_) {
-      if (!inflight_pgm_cleared_.count(fk)) {
-        pgm_retry_cleared_.erase(fk);
-        pgm_retry_occupied_.insert(fk);
-      }
-    }
     for (const auto& fk : inflight_pgm_cleared_) {
-      pgm_retry_occupied_.erase(fk);
+      if (!inflight_pgm_occupied_.count(fk)) {
+        pgm_retry_occupied_.erase(fk);
+      }
       pgm_retry_cleared_.insert(fk);
     }
+    for (const auto& fk : inflight_pgm_occupied_) {
+      pgm_retry_occupied_.insert(fk);
+    }
     LOG(WARNING) << " ---> [MapUpdate] commit gen=" << ready->generation
-                 << " synced PCD but not occupancy map; retaining "
+                 << " could not sync occupancy map; retaining "
                  << (pgm_retry_occupied_.size() + pgm_retry_cleared_.size())
                  << " cells for PGM retry";
   } else {
@@ -1178,14 +1210,17 @@ bool DynamicMapUpdater::flushSyncIfNeeded(bool rebuild_reloc_targets, CommitResu
   std::unordered_set<FineKey, FineKeyHash> pcd_occupied;
   std::unordered_set<FineKey, FineKeyHash> pcd_cleared;
   computeDirtySets(pcd_occupied, pcd_cleared);
-  const std::size_t total_pcd_dirty = pcd_occupied.size() + pcd_cleared.size();
+  std::unordered_set<FineKey, FineKeyHash> pcd_dirty_union = pcd_occupied;
+  pcd_dirty_union.insert(pcd_cleared.begin(), pcd_cleared.end());
+  const std::size_t total_pcd_dirty = pcd_dirty_union.size();
   const bool has_pgm_retry = !pgm_retry_occupied_.empty() || !pgm_retry_cleared_.empty();
   const bool meets_total = static_cast<int>(total_pcd_dirty) >= cfg.min_changed_voxels;
   const bool meets_cluster =
       total_pcd_dirty > 0 &&
       (meets_total ||
        static_cast<int>(computeMaxClusterSize(pcd_occupied, pcd_cleared)) >= cfg.min_cluster_voxels);
-  if (!meets_total && !meets_cluster && !has_pgm_retry) {
+  const bool sync_pcd_now = meets_total || meets_cluster;
+  if (!sync_pcd_now && !has_pgm_retry) {
     if (had_bg && out_result) {
       *out_result = std::move(completed_bg);
     }
@@ -1194,13 +1229,16 @@ bool DynamicMapUpdater::flushSyncIfNeeded(bool rebuild_reloc_targets, CommitResu
 
   std::unordered_set<FineKey, FineKeyHash> newly_occupied = pgm_retry_occupied_;
   std::unordered_set<FineKey, FineKeyHash> newly_cleared = pgm_retry_cleared_;
-  for (const auto& fk : pcd_occupied) {
-    newly_cleared.erase(fk);
-    newly_occupied.insert(fk);
-  }
-  for (const auto& fk : pcd_cleared) {
-    newly_occupied.erase(fk);
-    newly_cleared.insert(fk);
+  if (sync_pcd_now) {
+    for (const auto& fk : pcd_cleared) {
+      if (!pcd_occupied.count(fk)) {
+        newly_occupied.erase(fk);
+      }
+      newly_cleared.insert(fk);
+    }
+    for (const auto& fk : pcd_occupied) {
+      newly_occupied.insert(fk);
+    }
   }
 
   CommitJob job;
@@ -1211,14 +1249,15 @@ bool DynamicMapUpdater::flushSyncIfNeeded(bool rebuild_reloc_targets, CommitResu
   job.base_map = base_map_;
   job.ground_grid = ground_grid_;
   job.sub_inv_resolution = sub_inv_resolution_;
-  job.added_voxels = added_voxels_;
-  job.removed_subvoxels = removed_subvoxels_;
+  job.added_voxels = sync_pcd_now ? added_voxels_ : committed_added_voxels_;
+  job.removed_subvoxels = sync_pcd_now ? removed_subvoxels_ : committed_removed_keys_;
   job.newly_occupied = std::move(newly_occupied);
   job.newly_cleared = std::move(newly_cleared);
-  job.sync_pcd = (total_pcd_dirty > 0);
-  job.rebuild_reloc_targets = job.sync_pcd && rebuild_reloc_targets && (out_result != nullptr);
+  job.sync_pcd = sync_pcd_now;
+  job.rebuild_reloc_targets = sync_pcd_now && rebuild_reloc_targets && (out_result != nullptr);
 
   LOG(INFO) << " ---> [MapUpdate] synchronous flush (pcd_dirty=" << total_pcd_dirty
+            << ", sync_pcd=" << (job.sync_pcd ? "true" : "false")
             << ", pgm_retry=" << (has_pgm_retry ? "true" : "false")
             << ", rebuild_targets=" << (job.rebuild_reloc_targets ? "true" : "false") << ")";
   CommitResult res = executeCommitJob(job);
@@ -1230,11 +1269,16 @@ bool DynamicMapUpdater::flushSyncIfNeeded(bool rebuild_reloc_targets, CommitResu
   }
 
   if (job.sync_pcd) {
-    committed_added_keys_.clear();
-    for (const auto& [fk, vox] : added_voxels_) committed_added_keys_.insert(fk);
+    committed_added_voxels_ = added_voxels_;
     committed_removed_keys_ = removed_subvoxels_;
   } else if (had_bg) {
-    // Preserve targets rebuilt by the completed background commit on a pure PGM-retry flush.
+    // Preserve PCD and targets rebuilt by the completed background commit on a pure PGM-retry flush.
+    if (completed_bg.pcd_synced) {
+      res.pcd_synced = true;
+      res.updated_map = completed_bg.updated_map;
+      res.added_voxels = completed_bg.added_voxels;
+      res.removed_voxels = completed_bg.removed_voxels;
+    }
     if (!res.ndt && completed_bg.ndt) res.ndt = completed_bg.ndt;
     if (!res.genz && completed_bg.genz) res.genz = std::move(completed_bg.genz);
     if (!res.fc && completed_bg.fc) res.fc = std::move(completed_bg.fc);
@@ -1419,13 +1463,14 @@ DynamicMapUpdater::PgmSyncStatus DynamicMapUpdater::syncPgmMap(const CommitJob& 
   if (ec) return PgmSyncStatus::kFailed;
   const bool has_yaml = fs::exists(yaml_path, ec);
   if (ec) return PgmSyncStatus::kFailed;
+  const bool pgm_was_absent = fs::exists(patch_dir / "map.origin.pgm.absent", ec);
+  if (ec) return PgmSyncStatus::kFailed;
+  const bool yaml_was_absent = fs::exists(patch_dir / "map.origin.yaml.absent", ec);
+  if (ec) return PgmSyncStatus::kFailed;
+  const bool generated_from_absent =
+      pgm_cfg.create_if_missing && pgm_was_absent && yaml_was_absent;
+
   if (has_pgm != has_yaml) {
-    const bool pgm_was_absent = fs::exists(patch_dir / "map.origin.pgm.absent", ec);
-    if (ec) return PgmSyncStatus::kFailed;
-    const bool yaml_was_absent = fs::exists(patch_dir / "map.origin.yaml.absent", ec);
-    if (ec) return PgmSyncStatus::kFailed;
-    const bool generated_from_absent =
-        pgm_cfg.create_if_missing && pgm_was_absent && yaml_was_absent;
     if (!generated_from_absent) {
       LOG(WARNING) << " ---> [MapUpdate] incomplete existing occupancy map (pgm=" << has_pgm
                    << ", yaml=" << has_yaml << "); skipping PGM sync";
@@ -1438,111 +1483,123 @@ DynamicMapUpdater::PgmSyncStatus DynamicMapUpdater::syncPgmMap(const CommitJob& 
   if (has_pgm && has_yaml) {
     MapYamlMeta meta;
     PgmImage img;
-    if (!parseMapYaml(yaml_path, meta) || !readPgmFile(pgm_path, img)) {
-      LOG(WARNING) << " ---> [MapUpdate] failed to parse existing map.pgm/map.yaml; skipping PGM sync";
-      return PgmSyncStatus::kSkipped;
+    const FileLoadStatus yaml_st = parseMapYaml(yaml_path, meta);
+    const FileLoadStatus pgm_st =
+        (yaml_st == FileLoadStatus::kOk) ? readPgmFile(pgm_path, img) : FileLoadStatus::kOk;
+    if (yaml_st == FileLoadStatus::kIoError || pgm_st == FileLoadStatus::kIoError) {
+      LOG(WARNING) << " ---> [MapUpdate] I/O error reading map.pgm/map.yaml; deferring PGM sync";
+      return PgmSyncStatus::kFailed;
     }
+    if (yaml_st != FileLoadStatus::kOk || pgm_st != FileLoadStatus::kOk) {
+      if (!generated_from_absent) {
+        LOG(WARNING) << " ---> [MapUpdate] failed to parse existing map.pgm/map.yaml; skipping PGM sync";
+        return PgmSyncStatus::kSkipped;
+      }
+      LOG(WARNING) << " ---> [MapUpdate] corrupted generated map.pgm/map.yaml; regenerating from scratch";
+    } else {
+      const uint8_t occ_val = (meta.negate == 1) ? 254 : 0;
+      const uint8_t free_val = (meta.negate == 1) ? 0 : 254;
+      const double inv_res = 1.0 / meta.resolution;
+      const double cos_yaw = std::cos(meta.origin_yaw);
+      const double sin_yaw = std::sin(meta.origin_yaw);
+      const bool rotated = std::abs(meta.origin_yaw) > 1e-6;
+      const auto world_to_uv = [&](double wx, double wy) -> std::pair<double, double> {
+        const double dx = wx - meta.origin_x;
+        const double dy = wy - meta.origin_y;
+        return {cos_yaw * dx + sin_yaw * dy, -sin_yaw * dx + cos_yaw * dy};
+      };
 
-    const uint8_t occ_val = (meta.negate == 1) ? 254 : 0;
-    const uint8_t free_val = (meta.negate == 1) ? 0 : 254;
-    const double inv_res = 1.0 / meta.resolution;
-    const double cos_yaw = std::cos(meta.origin_yaw);
-    const double sin_yaw = std::sin(meta.origin_yaw);
-    const bool rotated = std::abs(meta.origin_yaw) > 1e-6;
-    const auto world_to_uv = [&](double wx, double wy) -> std::pair<double, double> {
-      const double dx = wx - meta.origin_x;
-      const double dy = wy - meta.origin_y;
-      return {cos_yaw * dx + sin_yaw * dy, -sin_yaw * dx + cos_yaw * dy};
-    };
+      // 1. Clear pixels intersecting newly carved 3D obstacle footprints (preserving GIMP virtual
+      //    walls elsewhere) and record every cleared pixel index so all surviving obstacles
+      //    sharing those pixels are re-projected regardless of occupancy resolution or rotation.
+      std::unordered_set<std::size_t> dirty_pixels;
+      dirty_pixels.reserve(job.newly_cleared.size() * 4 + 16);
 
-    // 1. Clear pixels inside newly carved 3D obstacle footprints (preserving GIMP virtual walls elsewhere)
-    //    and record every cleared pixel index so all surviving obstacles sharing those pixels are
-    //    re-projected regardless of occupancy resolution vs. sub-voxel size.
-    std::unordered_set<std::size_t> dirty_pixels;
-    dirty_pixels.reserve(job.newly_cleared.size() * 4 + 16);
+      constexpr double kEdgeInset = 1e-5;
+      for (const auto& fk : job.newly_cleared) {
+        const double x0 = fk.x() * sub_res + kEdgeInset;
+        const double x1 = (fk.x() + 1) * sub_res - kEdgeInset;
+        const double y0 = fk.y() * sub_res + kEdgeInset;
+        const double y1 = (fk.y() + 1) * sub_res - kEdgeInset;
+        if (x0 >= x1 || y0 >= y1) continue;
 
-    for (const auto& fk : job.newly_cleared) {
-      const double x0 = fk.x() * sub_res;
-      const double x1 = (fk.x() + 1) * sub_res;
-      const double y0 = fk.y() * sub_res;
-      const double y1 = (fk.y() + 1) * sub_res;
+        const auto [u00, v00] = world_to_uv(x0, y0);
+        const auto [u10, v10] = world_to_uv(x1, y0);
+        const auto [u01, v01] = world_to_uv(x0, y1);
+        const auto [u11, v11] = world_to_uv(x1, y1);
+        const double min_u = std::min({u00, u10, u01, u11});
+        const double max_u = std::max({u00, u10, u01, u11});
+        const double min_v = std::min({v00, v10, v01, v11});
+        const double max_v = std::max({v00, v10, v01, v11});
 
-      const auto [u00, v00] = world_to_uv(x0, y0);
-      const auto [u10, v10] = world_to_uv(x1, y0);
-      const auto [u01, v01] = world_to_uv(x0, y1);
-      const auto [u11, v11] = world_to_uv(x1, y1);
-      const double min_u = std::min({u00, u10, u01, u11});
-      const double max_u = std::max({u00, u10, u01, u11});
-      const double min_v = std::min({v00, v10, v01, v11});
-      const double max_v = std::max({v00, v10, v01, v11});
+        const int ix0 = std::max(0, static_cast<int>(std::floor(min_u * inv_res)));
+        const int ix1 = std::min(img.width - 1, static_cast<int>(std::floor(max_u * inv_res)));
+        const int iy0 = std::max(0, static_cast<int>(std::floor(min_v * inv_res)));
+        const int iy1 = std::min(img.height - 1, static_cast<int>(std::floor(max_v * inv_res)));
 
-      const int ix0 = std::max(0, static_cast<int>(std::floor(min_u * inv_res)));
-      const int ix1 = std::min(img.width - 1, static_cast<int>(std::floor((max_u - 1e-5) * inv_res)));
-      const int iy0 = std::max(0, static_cast<int>(std::floor(min_v * inv_res)));
-      const int iy1 = std::min(img.height - 1, static_cast<int>(std::floor((max_v - 1e-5) * inv_res)));
-
-      for (int iy = iy0; iy <= iy1; ++iy) {
-        const int row = img.height - 1 - iy;
-        for (int ix = ix0; ix <= ix1; ++ix) {
-          if (rotated) {
-            const double uc = (static_cast<double>(ix) + 0.5) * meta.resolution;
-            const double vc = (static_cast<double>(iy) + 0.5) * meta.resolution;
-            const double wx = meta.origin_x + cos_yaw * uc - sin_yaw * vc;
-            const double wy = meta.origin_y + sin_yaw * uc + cos_yaw * vc;
-            if (wx < x0 || wx > x1 || wy < y0 || wy > y1) continue;
+        for (int iy = iy0; iy <= iy1; ++iy) {
+          const int row = img.height - 1 - iy;
+          const double va = static_cast<double>(iy) * meta.resolution;
+          const double vb = static_cast<double>(iy + 1) * meta.resolution;
+          for (int ix = ix0; ix <= ix1; ++ix) {
+            if (rotated) {
+              // Exact 2D Separating Axis Theorem overlap test between pixel [ua, ub] x [va, vb]
+              // in grid space and inset sub-voxel [x0, x1] x [y0, y1] in world space.
+              const double ua = static_cast<double>(ix) * meta.resolution;
+              const double ub = static_cast<double>(ix + 1) * meta.resolution;
+              const double px_min_x = meta.origin_x + std::min(cos_yaw * ua, cos_yaw * ub) +
+                                      std::min(-sin_yaw * va, -sin_yaw * vb);
+              const double px_max_x = meta.origin_x + std::max(cos_yaw * ua, cos_yaw * ub) +
+                                      std::max(-sin_yaw * va, -sin_yaw * vb);
+              if (px_max_x < x0 || px_min_x > x1) continue;
+              const double px_min_y = meta.origin_y + std::min(sin_yaw * ua, sin_yaw * ub) +
+                                      std::min(cos_yaw * va, cos_yaw * vb);
+              const double px_max_y = meta.origin_y + std::max(sin_yaw * ua, sin_yaw * ub) +
+                                      std::max(cos_yaw * va, cos_yaw * vb);
+              if (px_max_y < y0 || px_min_y > y1) continue;
+            }
+            const std::size_t px_idx = static_cast<std::size_t>(row) * img.width + ix;
+            img.pixels[px_idx] = free_val;
+            dirty_pixels.insert(px_idx);
           }
-          const std::size_t px_idx = static_cast<std::size_t>(row) * img.width + ix;
-          img.pixels[px_idx] = free_val;
-          dirty_pixels.insert(px_idx);
         }
       }
-      if (rotated) {
-        const auto [uc_vox, vc_vox] = world_to_uv(0.5 * (x0 + x1), 0.5 * (y0 + y1));
-        const int cix = static_cast<int>(std::floor(uc_vox * inv_res));
-        const int ciy = static_cast<int>(std::floor(vc_vox * inv_res));
-        if (cix >= 0 && cix < img.width && ciy >= 0 && ciy < img.height) {
-          const std::size_t px_idx =
-              static_cast<std::size_t>(img.height - 1 - ciy) * img.width + cix;
-          img.pixels[px_idx] = free_val;
-          dirty_pixels.insert(px_idx);
-        }
+
+      // 2. Build 2D dirty XY neighborhood around newly cleared & newly occupied sub-voxels,
+      //    then re-project all persistent obstacle points (z_min <= z - z_ground <= z_max) falling
+      //    either in that neighborhood OR inside any cleared pixel.
+      std::unordered_set<Eigen::Vector2i, Grid2DHash> dirty_xy;
+      for (const auto& fk : job.newly_cleared) {
+        for (int dx = -1; dx <= 1; ++dx)
+          for (int dy = -1; dy <= 1; ++dy)
+            dirty_xy.emplace(fk.x() + dx, fk.y() + dy);
       }
-    }
+      for (const auto& fk : job.newly_occupied) {
+        for (int dx = -1; dx <= 1; ++dx)
+          for (int dy = -1; dy <= 1; ++dy)
+            dirty_xy.emplace(fk.x() + dx, fk.y() + dy);
+      }
 
-    // 2. Build 2D dirty XY neighborhood around newly cleared & newly occupied sub-voxels,
-    //    then re-project all persistent obstacle points (z_min <= z - z_ground <= z_max) falling
-    //    either in that neighborhood OR inside any cleared pixel.
-    std::unordered_set<Eigen::Vector2i, Grid2DHash> dirty_xy;
-    for (const auto& fk : job.newly_cleared) {
-      for (int dx = -1; dx <= 1; ++dx)
-        for (int dy = -1; dy <= 1; ++dy)
-          dirty_xy.emplace(fk.x() + dx, fk.y() + dy);
-    }
-    for (const auto& fk : job.newly_occupied) {
-      for (int dx = -1; dx <= 1; ++dx)
-        for (int dy = -1; dy <= 1; ++dy)
-          dirty_xy.emplace(fk.x() + dx, fk.y() + dy);
-    }
+      for (const auto& pt : updated_map.points) {
+        if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z)) continue;
+        const auto [u, v] = world_to_uv(pt.x, pt.y);
+        const int ix = static_cast<int>(std::floor(u * inv_res));
+        const int iy = static_cast<int>(std::floor(v * inv_res));
+        if (ix < 0 || ix >= img.width || iy < 0 || iy >= img.height) continue;
+        const std::size_t px_idx = static_cast<std::size_t>(img.height - 1 - iy) * img.width + ix;
+        const Eigen::Vector2i k2(static_cast<int>(std::floor(pt.x * job.sub_inv_resolution)),
+                                 static_cast<int>(std::floor(pt.y * job.sub_inv_resolution)));
+        if (!dirty_pixels.count(px_idx) && !dirty_xy.count(k2)) continue;
+        const float h = pt.z - job.ground_grid.query(pt.x, pt.y);
+        if (h < z_min || h > z_max) continue;
 
-    for (const auto& pt : updated_map.points) {
-      if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z)) continue;
-      const auto [u, v] = world_to_uv(pt.x, pt.y);
-      const int ix = static_cast<int>(std::floor(u * inv_res));
-      const int iy = static_cast<int>(std::floor(v * inv_res));
-      if (ix < 0 || ix >= img.width || iy < 0 || iy >= img.height) continue;
-      const std::size_t px_idx = static_cast<std::size_t>(img.height - 1 - iy) * img.width + ix;
-      const Eigen::Vector2i k2(static_cast<int>(std::floor(pt.x * job.sub_inv_resolution)),
-                               static_cast<int>(std::floor(pt.y * job.sub_inv_resolution)));
-      if (!dirty_pixels.count(px_idx) && !dirty_xy.count(k2)) continue;
-      const float h = pt.z - job.ground_grid.query(pt.x, pt.y);
-      if (h < z_min || h > z_max) continue;
+        img.pixels[px_idx] = occ_val;
+      }
 
-      img.pixels[px_idx] = occ_val;
+      if (!writePgmAtomic(patch_dir, pgm_path, img)) return PgmSyncStatus::kFailed;
+      out_yaml_path = yaml_path.string();
+      return PgmSyncStatus::kUpdated;
     }
-
-    if (!writePgmAtomic(patch_dir, pgm_path, img)) return PgmSyncStatus::kFailed;
-    out_yaml_path = yaml_path.string();
-    return PgmSyncStatus::kUpdated;
   }
 
   if (!pgm_cfg.create_if_missing || updated_map.empty()) return PgmSyncStatus::kSkipped;
@@ -1561,7 +1618,7 @@ DynamicMapUpdater::PgmSyncStatus DynamicMapUpdater::syncPgmMap(const CommitJob& 
     min_y = std::min<double>(min_y, pt.y);
     max_y = std::max<double>(max_y, pt.y);
   }
-  if (min_x >= max_x || min_y >= max_y) return PgmSyncStatus::kSkipped;
+  if (min_x > max_x || min_y > max_y) return PgmSyncStatus::kSkipped;
 
   constexpr double kPad = 1.0;
   const double origin_x = min_x - kPad;
@@ -1661,6 +1718,7 @@ DynamicMapUpdater::CommitResult DynamicMapUpdater::executeCommitJob(const Commit
       }
       res.reloc_targets_rebuilt = true;
     }
+    res.pcd_synced = true;
   }
 
   const PgmSyncStatus pgm_status = syncPgmMap(job, *res.updated_map, res.map_yaml_path);
@@ -1672,6 +1730,7 @@ DynamicMapUpdater::CommitResult DynamicMapUpdater::executeCommitJob(const Commit
       std::chrono::steady_clock::now() - t0).count();
   LOG(INFO) << " ---> [MapUpdate] commit gen=" << job.generation << " finished in " << ms
             << " ms (points=" << res.updated_map->size()
+            << ", pcd_synced=" << (res.pcd_synced ? "true" : "false")
             << ", pgm_updated=" << (res.pgm_updated ? "true" : "false")
             << ", pgm_retry=" << (res.pgm_sync_pending ? "true" : "false") << ")";
   return res;
@@ -1694,23 +1753,29 @@ bool DynamicMapUpdater::resetToOrigin(CloudPtr& restored_map, std::string& out_y
   const fs::path orig_pcd = originPcdPath(map_dir_, map_name_);
   const fs::path target_pcd = fs::path(map_dir_) / map_name_;
   std::error_code ec;
+  const bool has_orig_pcd = fs::exists(orig_pcd, ec);
+  if (ec) {
+    message = "Failed to inspect origin backup " + orig_pcd.string() + ": " + ec.message();
+    return false;
+  }
 
-  if (fs::exists(orig_pcd, ec)) {
-    if (!copyFileAtomic(orig_pcd, target_pcd, patch_dir)) {
-      message = "Failed to copy origin PCD backup back to " + target_pcd.string();
-      return false;
-    }
-
+  if (has_orig_pcd) {
+    // Validate the backup PCD in memory before overwriting the live global.pcd on disk.
     CloudPtr loaded(new PointCloudType());
-    if (pcl::io::loadPCDFile<PointType>(target_pcd.string(), *loaded) == -1) {
-      message = "Failed to reload restored origin PCD " + target_pcd.string();
+    if (pcl::io::loadPCDFile<PointType>(orig_pcd.string(), *loaded) == -1) {
+      message = "Failed to load origin PCD backup " + orig_pcd.string();
       return false;
     }
     std::vector<int> nan_idx;
     loaded->is_dense = false;
     pcl::removeNaNFromPointCloud(*loaded, *loaded, nan_idx);
     if (loaded->empty()) {
-      message = "Restored origin PCD is empty";
+      message = "Origin PCD backup is empty";
+      return false;
+    }
+
+    if (!copyFileAtomic(orig_pcd, target_pcd, patch_dir)) {
+      message = "Failed to copy origin PCD backup back to " + target_pcd.string();
       return false;
     }
 
@@ -1722,14 +1787,29 @@ bool DynamicMapUpdater::resetToOrigin(CloudPtr& restored_map, std::string& out_y
     const fs::path target_yaml = fs::path(map_dir_) / "map.yaml";
     bool pgm_removed = false;
 
-    if (fs::exists(orig_pgm, ec)) {
+    const bool has_orig_pgm = fs::exists(orig_pgm, ec);
+    if (ec) {
+      message = "Failed to inspect " + orig_pgm.string() + ": " + ec.message();
+      return false;
+    }
+    const bool has_absent_pgm = fs::exists(absent_pgm, ec);
+    if (ec) {
+      message = "Failed to inspect " + absent_pgm.string() + ": " + ec.message();
+      return false;
+    }
+    if (has_orig_pgm) {
       if (!copyFileAtomic(orig_pgm, target_pgm, patch_dir)) {
         message = "Failed to copy origin PGM backup back to " + target_pgm.string();
         return false;
       }
       pgm_restored = true;
-    } else if (fs::exists(absent_pgm, ec) || !fs::exists(orig_pgm, ec)) {
-      if (fs::exists(target_pgm, ec)) {
+    } else if (has_absent_pgm) {
+      const bool has_target_pgm = fs::exists(target_pgm, ec);
+      if (ec) {
+        message = "Failed to inspect " + target_pgm.string() + ": " + ec.message();
+        return false;
+      }
+      if (has_target_pgm) {
         std::error_code rm_ec;
         fs::remove(target_pgm, rm_ec);
         if (rm_ec && fs::exists(target_pgm, ec)) {
@@ -1740,14 +1820,29 @@ bool DynamicMapUpdater::resetToOrigin(CloudPtr& restored_map, std::string& out_y
       }
     }
 
-    if (fs::exists(orig_yaml, ec)) {
+    const bool has_orig_yaml = fs::exists(orig_yaml, ec);
+    if (ec) {
+      message = "Failed to inspect " + orig_yaml.string() + ": " + ec.message();
+      return false;
+    }
+    const bool has_absent_yaml = fs::exists(absent_yaml, ec);
+    if (ec) {
+      message = "Failed to inspect " + absent_yaml.string() + ": " + ec.message();
+      return false;
+    }
+    if (has_orig_yaml) {
       if (!copyFileAtomic(orig_yaml, target_yaml, patch_dir)) {
         message = "Failed to copy origin YAML backup back to " + target_yaml.string();
         return false;
       }
       out_yaml_path = target_yaml.string();
-    } else if (fs::exists(absent_yaml, ec) || !fs::exists(orig_yaml, ec)) {
-      if (fs::exists(target_yaml, ec)) {
+    } else if (has_absent_yaml) {
+      const bool has_target_yaml = fs::exists(target_yaml, ec);
+      if (ec) {
+        message = "Failed to inspect " + target_yaml.string() + ": " + ec.message();
+        return false;
+      }
+      if (has_target_yaml) {
         std::error_code rm_ec;
         fs::remove(target_yaml, rm_ec);
         if (rm_ec && fs::exists(target_yaml, ec)) {
@@ -1776,7 +1871,7 @@ bool DynamicMapUpdater::resetToOrigin(CloudPtr& restored_map, std::string& out_y
   removed_subvoxels_.clear();
   pending_add_.clear();
   carve_miss_.clear();
-  committed_added_keys_.clear();
+  committed_added_voxels_.clear();
   committed_removed_keys_.clear();
   inflight_added_snapshot_.clear();
   inflight_removed_snapshot_.clear();
