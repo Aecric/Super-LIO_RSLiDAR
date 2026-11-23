@@ -1246,9 +1246,17 @@ TEST_F(DynamicMapUpdaterTest, ResetToOriginFailsSafeOnBackupInspectionErrorAndPr
   ASSERT_TRUE(updater.processScan(makeScanInput(2.0, p2, &s2), ivox));
   ASSERT_TRUE(updater.flushSyncIfNeeded(false, nullptr));
 
-  // Replace map.origin.pgm with a self-referential symlink (ELOOP): resetToOrigin must fail
-  // safely rather than treating exists()==false as "origin absent" and deleting live map.pgm.
+  // Snapshot live patched PCD point count before triggering failed resets.
+  const fs::path live_pcd_path = tmp.path() / "global.pcd";
+  CloudPtr before_reset(new PointCloudType());
+  ASSERT_EQ(pcl::io::loadPCDFile<PointType>(live_pcd_path.string(), *before_reset), 0);
+  ASSERT_EQ(before_reset->size(), base->size() + 1);
+
+  // Case A: Replace map.origin.pgm with a self-referential symlink (ELOOP): resetToOrigin must
+  // fail BEFORE replacing live global.pcd or deleting live map.pgm.
   const fs::path orig_pgm = tmp.path() / "patch" / "map.origin.pgm";
+  const fs::path saved_orig_pgm = tmp.path() / "saved_origin.pgm";
+  fs::copy_file(orig_pgm, saved_orig_pgm);
   fs::remove(orig_pgm);
   fs::create_symlink(orig_pgm.filename(), orig_pgm);
 
@@ -1259,6 +1267,32 @@ TEST_F(DynamicMapUpdaterTest, ResetToOriginFailsSafeOnBackupInspectionErrorAndPr
   EXPECT_FALSE(updater.resetToOrigin(restored, yaml_path, pgm_restored, msg));
   EXPECT_TRUE(fs::exists(tmp.path() / "map.pgm"));
   EXPECT_EQ(updater.addedCount(), 1u);
+  CloudPtr after_eloop(new PointCloudType());
+  ASSERT_EQ(pcl::io::loadPCDFile<PointType>(live_pcd_path.string(), *after_eloop), 0);
+  EXPECT_EQ(after_eloop->size(), base->size() + 1);  // Live patched PCD preserved on disk!
+
+  // Case B: Restore valid map.origin.pgm, but obstruct live map.yaml with a directory:
+  // resetToOrigin must again preserve the live patched global.pcd on disk.
+  fs::remove(orig_pgm);
+  fs::copy_file(saved_orig_pgm, orig_pgm);
+  const fs::path live_yaml = tmp.path() / "map.yaml";
+  fs::remove(live_yaml);
+  fs::create_directories(live_yaml / "obstruct");
+
+  EXPECT_FALSE(updater.resetToOrigin(restored, yaml_path, pgm_restored, msg));
+  EXPECT_EQ(updater.addedCount(), 1u);
+  CloudPtr after_yaml_fail(new PointCloudType());
+  ASSERT_EQ(pcl::io::loadPCDFile<PointType>(live_pcd_path.string(), *after_yaml_fail), 0);
+  EXPECT_EQ(after_yaml_fail->size(), base->size() + 1);  // Live patched PCD still preserved!
+
+  // Clearing the obstruction allows a clean transactional reset to factory origin.
+  fs::remove_all(live_yaml);
+  EXPECT_TRUE(updater.resetToOrigin(restored, yaml_path, pgm_restored, msg));
+  EXPECT_TRUE(pgm_restored);
+  EXPECT_EQ(updater.addedCount(), 0u);
+  CloudPtr after_clean_reset(new PointCloudType());
+  ASSERT_EQ(pcl::io::loadPCDFile<PointType>(live_pcd_path.string(), *after_clean_reset), 0);
+  EXPECT_EQ(after_clean_reset->size(), base->size());
 }
 
 }  // namespace

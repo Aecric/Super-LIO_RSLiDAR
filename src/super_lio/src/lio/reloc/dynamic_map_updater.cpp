@@ -1686,16 +1686,6 @@ DynamicMapUpdater::CommitResult DynamicMapUpdater::executeCommitJob(const Commit
   }
 
   if (job.sync_pcd) {
-    if (!ensureOriginBackup(job.map_dir, job.map_name)) {
-      return res;
-    }
-
-    const std::string target_pcd = (fs::path(job.map_dir) / job.map_name).string();
-    if (!writePcdAtomic(job.map_dir, target_pcd, *res.updated_map)) {
-      LOG(ERROR) << " ---> [MapUpdate] failed to atomically write updated PCD: " << target_pcd;
-      return res;
-    }
-
     if (job.rebuild_reloc_targets) {
       res.ndt.reset(new pcl::NormalDistributionsTransform<PointType, PointType>());
       res.ndt->setTransformationEpsilon(1e-4);
@@ -1717,6 +1707,16 @@ DynamicMapUpdater::CommitResult DynamicMapUpdater::executeCommitJob(const Commit
         }
       }
       res.reloc_targets_rebuilt = true;
+    }
+
+    if (!ensureOriginBackup(job.map_dir, job.map_name)) {
+      return res;
+    }
+
+    const std::string target_pcd = (fs::path(job.map_dir) / job.map_name).string();
+    if (!writePcdAtomic(job.map_dir, target_pcd, *res.updated_map)) {
+      LOG(ERROR) << " ---> [MapUpdate] failed to atomically write updated PCD: " << target_pcd;
+      return res;
     }
     res.pcd_synced = true;
   }
@@ -1741,13 +1741,9 @@ bool DynamicMapUpdater::resetToOrigin(CloudPtr& restored_map, std::string& out_y
   pgm_restored = false;
   out_yaml_path.clear();
 
-  // Cancel/supersede any running background commit and wait for it to finish cleanly.
-  ++generation_;
+  // Wait for any in-flight background commit to finish touching disk, but do NOT discard
+  // `pending_result_` or advance `generation_` until disk restoration succeeds.
   joinCommitThread();
-  {
-    std::lock_guard<std::mutex> lock(result_mutex_);
-    pending_result_.reset();
-  }
 
   const fs::path patch_dir = patchDirPath(map_dir_);
   const fs::path orig_pcd = originPcdPath(map_dir_, map_name_);
@@ -1760,7 +1756,51 @@ bool DynamicMapUpdater::resetToOrigin(CloudPtr& restored_map, std::string& out_y
   }
 
   if (has_orig_pcd) {
-    // Validate the backup PCD in memory before overwriting the live global.pcd on disk.
+    const fs::path orig_pgm = patch_dir / "map.origin.pgm";
+    const fs::path orig_yaml = patch_dir / "map.origin.yaml";
+    const fs::path absent_pgm = patch_dir / "map.origin.pgm.absent";
+    const fs::path absent_yaml = patch_dir / "map.origin.yaml.absent";
+    const fs::path target_pgm = fs::path(map_dir_) / "map.pgm";
+    const fs::path target_yaml = fs::path(map_dir_) / "map.yaml";
+
+    // Phase 1: Inspect and validate all backup/target paths and stage temporary copies BEFORE
+    // modifying any live file on disk.
+    const bool has_orig_pgm = fs::exists(orig_pgm, ec);
+    if (ec) {
+      message = "Failed to inspect " + orig_pgm.string() + ": " + ec.message();
+      return false;
+    }
+    const bool has_absent_pgm = fs::exists(absent_pgm, ec);
+    if (ec) {
+      message = "Failed to inspect " + absent_pgm.string() + ": " + ec.message();
+      return false;
+    }
+    const bool has_target_pgm = fs::exists(target_pgm, ec);
+    if (ec) {
+      message = "Failed to inspect " + target_pgm.string() + ": " + ec.message();
+      return false;
+    }
+    const bool has_orig_yaml = fs::exists(orig_yaml, ec);
+    if (ec) {
+      message = "Failed to inspect " + orig_yaml.string() + ": " + ec.message();
+      return false;
+    }
+    const bool has_absent_yaml = fs::exists(absent_yaml, ec);
+    if (ec) {
+      message = "Failed to inspect " + absent_yaml.string() + ": " + ec.message();
+      return false;
+    }
+    const bool has_target_yaml = fs::exists(target_yaml, ec);
+    if (ec) {
+      message = "Failed to inspect " + target_yaml.string() + ": " + ec.message();
+      return false;
+    }
+    const bool has_target_pcd = fs::exists(target_pcd, ec);
+    if (ec) {
+      message = "Failed to inspect " + target_pcd.string() + ": " + ec.message();
+      return false;
+    }
+
     CloudPtr loaded(new PointCloudType());
     if (pcl::io::loadPCDFile<PointType>(orig_pcd.string(), *loaded) == -1) {
       message = "Failed to load origin PCD backup " + orig_pcd.string();
@@ -1774,84 +1814,120 @@ bool DynamicMapUpdater::resetToOrigin(CloudPtr& restored_map, std::string& out_y
       return false;
     }
 
-    if (!copyFileAtomic(orig_pcd, target_pcd, patch_dir)) {
-      message = "Failed to copy origin PCD backup back to " + target_pcd.string();
+    const fs::path stage_pcd = patch_dir / ".restore.pcd.tmp";
+    const fs::path stage_pgm = patch_dir / ".restore.pgm.tmp";
+    const fs::path stage_yaml = patch_dir / ".restore.yaml.tmp";
+    const fs::path rb_pcd = patch_dir / ".rollback.pcd.tmp";
+    const fs::path rb_pgm = patch_dir / ".rollback.pgm.tmp";
+    const fs::path rb_yaml = patch_dir / ".rollback.yaml.tmp";
+
+    auto cleanup_temps = [&]() {
+      std::error_code rm_ec;
+      for (const auto& p : {stage_pcd, stage_pgm, stage_yaml, rb_pcd, rb_pgm, rb_yaml}) {
+        fs::remove(p, rm_ec);
+      }
+    };
+
+    auto stage_copy = [&](const fs::path& src, const fs::path& dst, const char* label) -> bool {
+      std::error_code cp_ec;
+      fs::copy_file(src, dst, fs::copy_options::overwrite_existing, cp_ec);
+      if (cp_ec) {
+        message = std::string("Failed to stage ") + label + " (" + src.string() + "): " + cp_ec.message();
+        cleanup_temps();
+        return false;
+      }
+      return true;
+    };
+
+    if (!stage_copy(orig_pcd, stage_pcd, "origin PCD")) return false;
+    if (has_orig_pgm && !stage_copy(orig_pgm, stage_pgm, "origin PGM")) return false;
+    if (has_orig_yaml && !stage_copy(orig_yaml, stage_yaml, "origin YAML")) return false;
+
+    if (has_target_pcd && !stage_copy(target_pcd, rb_pcd, "rollback PCD")) return false;
+    if ((has_orig_pgm || has_absent_pgm) && has_target_pgm &&
+        !stage_copy(target_pgm, rb_pgm, "rollback PGM")) {
+      return false;
+    }
+    if ((has_orig_yaml || has_absent_yaml) && has_target_yaml &&
+        !stage_copy(target_yaml, rb_yaml, "rollback YAML")) {
       return false;
     }
 
-    const fs::path orig_pgm = patch_dir / "map.origin.pgm";
-    const fs::path orig_yaml = patch_dir / "map.origin.yaml";
-    const fs::path absent_pgm = patch_dir / "map.origin.pgm.absent";
-    const fs::path absent_yaml = patch_dir / "map.origin.yaml.absent";
-    const fs::path target_pgm = fs::path(map_dir_) / "map.pgm";
-    const fs::path target_yaml = fs::path(map_dir_) / "map.yaml";
+    // Phase 2: Apply staged replacements/removals with rollback if any step fails.
+    bool pcd_modified = false;
+    bool pgm_modified = false;
     bool pgm_removed = false;
 
-    const bool has_orig_pgm = fs::exists(orig_pgm, ec);
-    if (ec) {
-      message = "Failed to inspect " + orig_pgm.string() + ": " + ec.message();
-      return false;
-    }
-    const bool has_absent_pgm = fs::exists(absent_pgm, ec);
-    if (ec) {
-      message = "Failed to inspect " + absent_pgm.string() + ": " + ec.message();
-      return false;
-    }
-    if (has_orig_pgm) {
-      if (!copyFileAtomic(orig_pgm, target_pgm, patch_dir)) {
-        message = "Failed to copy origin PGM backup back to " + target_pgm.string();
-        return false;
-      }
-      pgm_restored = true;
-    } else if (has_absent_pgm) {
-      const bool has_target_pgm = fs::exists(target_pgm, ec);
-      if (ec) {
-        message = "Failed to inspect " + target_pgm.string() + ": " + ec.message();
-        return false;
-      }
-      if (has_target_pgm) {
-        std::error_code rm_ec;
-        fs::remove(target_pgm, rm_ec);
-        if (rm_ec && fs::exists(target_pgm, ec)) {
-          message = "Failed to remove generated " + target_pgm.string();
-          return false;
+    auto rollback_live = [&]() {
+      std::error_code rb_ec;
+      if (pgm_modified) {
+        if (has_target_pgm) {
+          replaceFileAtomic(rb_pgm, target_pgm);
+        } else {
+          fs::remove(target_pgm, rb_ec);
         }
-        pgm_removed = true;
       }
+      if (pcd_modified) {
+        if (has_target_pcd) {
+          if (!replaceFileAtomic(rb_pcd, target_pcd)) {
+            // Live PCD could not be rolled back; mark L1 state uncommitted so next flush repairs it.
+            committed_added_voxels_.clear();
+            committed_removed_keys_.clear();
+          }
+        } else {
+          fs::remove(target_pcd, rb_ec);
+        }
+      }
+      cleanup_temps();
+    };
+
+    if (!replaceFileAtomic(stage_pcd, target_pcd)) {
+      message = "Failed to copy origin PCD backup back to " + target_pcd.string();
+      cleanup_temps();
+      return false;
+    }
+    pcd_modified = true;
+
+    if (has_orig_pgm) {
+      if (!replaceFileAtomic(stage_pgm, target_pgm)) {
+        message = "Failed to copy origin PGM backup back to " + target_pgm.string();
+        rollback_live();
+        return false;
+      }
+      pgm_modified = true;
+      pgm_restored = true;
+    } else if (has_absent_pgm && has_target_pgm) {
+      std::error_code rm_ec;
+      fs::remove(target_pgm, rm_ec);
+      if (rm_ec && fs::exists(target_pgm, ec)) {
+        message = "Failed to remove generated " + target_pgm.string();
+        rollback_live();
+        return false;
+      }
+      pgm_modified = true;
+      pgm_removed = true;
     }
 
-    const bool has_orig_yaml = fs::exists(orig_yaml, ec);
-    if (ec) {
-      message = "Failed to inspect " + orig_yaml.string() + ": " + ec.message();
-      return false;
-    }
-    const bool has_absent_yaml = fs::exists(absent_yaml, ec);
-    if (ec) {
-      message = "Failed to inspect " + absent_yaml.string() + ": " + ec.message();
-      return false;
-    }
     if (has_orig_yaml) {
-      if (!copyFileAtomic(orig_yaml, target_yaml, patch_dir)) {
+      if (!replaceFileAtomic(stage_yaml, target_yaml)) {
         message = "Failed to copy origin YAML backup back to " + target_yaml.string();
+        pgm_restored = false;
+        rollback_live();
         return false;
       }
       out_yaml_path = target_yaml.string();
-    } else if (has_absent_yaml) {
-      const bool has_target_yaml = fs::exists(target_yaml, ec);
-      if (ec) {
-        message = "Failed to inspect " + target_yaml.string() + ": " + ec.message();
+    } else if (has_absent_yaml && has_target_yaml) {
+      std::error_code rm_ec;
+      fs::remove(target_yaml, rm_ec);
+      if (rm_ec && fs::exists(target_yaml, ec)) {
+        message = "Failed to remove generated " + target_yaml.string();
+        pgm_restored = false;
+        rollback_live();
         return false;
-      }
-      if (has_target_yaml) {
-        std::error_code rm_ec;
-        fs::remove(target_yaml, rm_ec);
-        if (rm_ec && fs::exists(target_yaml, ec)) {
-          message = "Failed to remove generated " + target_yaml.string();
-          return false;
-        }
       }
     }
 
+    cleanup_temps();
     setBaseMap(loaded);
     restored_map = loaded;
     message = "Restored global.pcd" +
@@ -1867,6 +1943,11 @@ bool DynamicMapUpdater::resetToOrigin(CloudPtr& restored_map, std::string& out_y
     message = "No disk commit yet; cleared in-memory L1 patches to factory base map";
   }
 
+  ++generation_;
+  {
+    std::lock_guard<std::mutex> lock(result_mutex_);
+    pending_result_.reset();
+  }
   added_voxels_.clear();
   removed_subvoxels_.clear();
   pending_add_.clear();
